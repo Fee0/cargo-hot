@@ -1,5 +1,4 @@
 use anyhow::Context;
-use itertools::Itertools;
 use object::{
     Endianness, Object, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
     macho::{self},
@@ -745,23 +744,36 @@ pub fn create_undefined_symbol_stub(
     triple: &Triple,
     aslr_reference: u64,
 ) -> Result<Vec<u8>> {
-    let sorted: Vec<_> = incrementals.iter().sorted().collect();
+    // Find all the undefined symbols in the incrementals. A crate can have hundreds of them,
+    // so they are read in parallel.
+    let symbols_per_file = incrementals
+        .par_iter()
+        .map(|path| -> Result<(Vec<String>, Vec<String>)> {
+            let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
+            let file = File::parse(bytes.deref() as &[u8])?;
+            let mut undefined = Vec::new();
+            let mut defined = Vec::new();
 
-    // Find all the undefined symbols in the incrementals
+            for symbol in file.symbols() {
+                if symbol.is_undefined() {
+                    undefined.push(symbol.name()?.to_string());
+                } else if symbol.is_global() {
+                    defined.push(symbol.name()?.to_string());
+                }
+            }
+
+            Ok((undefined, defined))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut undefined_symbols = HashSet::new();
     let mut defined_symbols = HashSet::new();
 
-    for path in sorted {
-        let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
-        let file = File::parse(bytes.deref() as &[u8])?;
-        for symbol in file.symbols() {
-            if symbol.is_undefined() {
-                let _ = undefined_symbols.insert(symbol.name()?.to_string());
-            } else if symbol.is_global() {
-                let _ = defined_symbols.insert(symbol.name()?.to_string());
-            }
-        }
+    for (undefined, defined) in symbols_per_file {
+        undefined_symbols.extend(undefined);
+        defined_symbols.extend(defined);
     }
+
     let undefined_symbols: Vec<_> = undefined_symbols
         .difference(&defined_symbols)
         .cloned()
@@ -909,27 +921,22 @@ pub fn create_undefined_symbol_stub(
             SymbolKind::Text => {
                 let jump_asm = match triple.operating_system {
                     // The windows ABI and calling convention is different than the SystemV ABI.
+                    //
+                    // The stubs must not clobber any register: `__chkstk` takes the size of the
+                    // stack frame to probe in RAX/EAX, so jumping through RAX/EAX makes it probe
+                    // a garbage size and overflow the stack.
                     OperatingSystem::Windows => match triple.architecture {
                         Architecture::X86_64 => {
-                            // Windows x64 has specific requirements for alignment and position-independent code
-                            let mut code = vec![
-                                0x48, 0xB8, // movabs RAX, imm64 (move 64-bit immediate to RAX)
-                            ];
-                            // Append the absolute 64-bit address
+                            let mut code = vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]; // jmp [rip+0]
+                            // Append the 64-bit address
                             code.extend_from_slice(&abs_addr.to_le_bytes());
-                            // jmp RAX (jump to the address in RAX)
-                            code.extend_from_slice(&[0xFF, 0xE0]);
                             code
                         }
                         Architecture::X86_32(_) => {
-                            // On Windows 32-bit, we can use direct jump but need proper alignment
-                            let mut code = vec![
-                                0xB8, // mov EAX, imm32 (move immediate value to EAX)
-                            ];
+                            let mut code = vec![0x68]; // push imm32
                             // Append the absolute 32-bit address
                             code.extend_from_slice(&(abs_addr as u32).to_le_bytes());
-                            // jmp EAX (jump to the address in EAX)
-                            code.extend_from_slice(&[0xFF, 0xE0]);
+                            code.push(0xC3); // ret (jumps to the pushed address)
                             code
                         }
                         Architecture::Aarch64(_) => {

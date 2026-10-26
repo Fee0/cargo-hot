@@ -5,17 +5,19 @@ use cargo_hot::rustc;
 use cargo_hot_protocol::server;
 
 use cargo::GlobalContext;
-use cargo::core::{Target, TargetKind};
+use cargo::core::dependency::DepKind;
+use cargo::core::{Package, Target, TargetKind, Workspace};
 use cargo::util::{Filesystem, command_prelude::*};
 
 use anyhow::{Context, anyhow};
 use itertools::Itertools;
 use serde::Deserialize;
+use subsecond_types::JumpTable;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tokio::process;
 use tokio::sync::mpsc;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -25,9 +27,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    #[cfg(debug_assertions)]
-    tracing_subscriber::fmt::init();
-
     if rustc::is_wrapping_rustc() {
         rustc::run_rustc().await;
         return Ok(ExitCode::SUCCESS);
@@ -45,9 +44,35 @@ async fn main() -> Result<ExitCode> {
         .subcommand()
         .ok_or(anyhow!("`cargo-hot` must be called with `hot` subcommand"))?;
 
+    init_logger(args.get_count("verbose"));
+
     let server = Server::new(gctx, args).await?;
 
     server.run().await
+}
+
+/// Errors are always shown. `-v` adds debug logs and `-vv` adds trace logs.
+///
+/// Logs go to stderr, and the logs of the `cargo` library itself are kept at warnings
+/// since they are very noisy.
+fn init_logger(verbose: u8) {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let level = match verbose {
+        0 => LevelFilter::INFO,
+        1 => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    };
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            Targets::new()
+                .with_target("cargo_hot", level)
+                .with_default(LevelFilter::WARN),
+        )
+        .init();
 }
 
 fn command() -> Command {
@@ -78,6 +103,15 @@ fn command() -> Command {
         .arg_lockfile_path()
         .arg_ignore_rust_version()
         .arg_unit_graph()
+        .arg(flag(
+            "auto-restart",
+            "Rebuild and restart the app when it crashes, instead of exiting",
+        ))
+        .arg(flag(
+            "full-debuginfo",
+            "Keep the profile's debug info for the hot reloaded crate \
+            (by default it is reduced to line tables, for faster patches)",
+        ))
         .arg_timings()
         .arg(
             opt(
@@ -93,12 +127,21 @@ fn command() -> Command {
         ))
 }
 
+/// With `--auto-restart`, a crash this soon after starting is not restarted right away,
+/// since the new app would likely crash the same way. The next change restarts it.
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct Server {
     gctx: GlobalContext,
     sysroot: PathBuf,
     crate_target: Target,
     crate_dir: PathBuf,
+    /// Source directory of the target being run. Changes here are hotpatched.
+    crate_src_dir: PathBuf,
+    /// Source directories of the workspace libraries the target depends on.
+    /// Changes here need a full rebuild and a restart.
+    dependency_src_dirs: Vec<PathBuf>,
     workspace_dir: PathBuf,
     profile: String,
     triple: Triple,
@@ -108,6 +151,7 @@ pub struct Server {
     extra_cargo_args: Vec<String>,
     extra_rustc_args: Vec<String>,
     verbose: u8,
+    auto_restart: bool,
     no_default_features: bool,
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
@@ -271,13 +315,22 @@ impl Server {
         let extra_cargo_args = vec![]; // TODO
 
         // TODO
-        let extra_rustc_args = cargo_config
+        let mut extra_rustc_args = cargo_config
             .rustflags(triple.to_string())
             .unwrap_or_default()
             .unwrap_or_default()
             .flags;
 
+        // Full debug info makes the linker write a PDB of hundreds of megabytes on every patch.
+        // Line tables keep file and line numbers in backtraces, and make patches ~40% faster.
+        // These args only reach the hot reloaded crate, and patches reuse them.
+        if !args.flag("full-debuginfo") {
+            extra_rustc_args.push("-Cdebuginfo=line-tables-only".to_owned());
+        }
+
         let crate_dir = main_package.manifest_path().parent().unwrap().to_path_buf();
+        let crate_src_dir = src_dir(&crate_target).context("Get source path")?;
+        let dependency_src_dirs = dependency_src_dirs(&workspace, main_package);
         let workspace_dir = workspace.root_manifest().parent().unwrap().to_path_buf();
 
         Ok(Self {
@@ -285,6 +338,8 @@ impl Server {
             sysroot: PathBuf::from(sysroot),
             crate_target,
             crate_dir,
+            crate_src_dir,
+            dependency_src_dirs,
             workspace_dir,
             profile,
             triple,
@@ -297,6 +352,7 @@ impl Server {
             extra_cargo_args,
             extra_rustc_args,
             verbose: args.get_count("verbose"),
+            auto_restart: args.flag("auto-restart"),
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
             custom_linker,
@@ -360,53 +416,134 @@ impl Server {
             Box::new(notify::recommended_watcher(handler)?)
         };
 
-        let build = self.build(BuildMode::Fat).await?;
-        let mut executable = tokio::process::Command::new(self.main_exe())
-            .args(&self.exe_args)
-            .spawn()?;
+        let mut connections = accept_connections(server::Server::bind().await?);
 
-        watcher.watch(
-            self.crate_target
-                .src_path()
-                .path()
-                .and_then(|path| path.parent())
-                .expect("Get source path"),
-            notify::RecursiveMode::Recursive,
-        )?;
+        let mut build = self.build(BuildMode::Fat).await?;
+        let mut executable = self.spawn_executable()?;
 
-        let mut server = server::Server::bind().await?;
-        let mut connection = server.accept().await?;
+        for dir in std::iter::once(&self.crate_src_dir).chain(&self.dependency_src_dirs) {
+            watcher.watch(dir, notify::RecursiveMode::Recursive)?;
+        }
+
+        let mut connection = None;
+        let mut needs_restart = false;
+        let mut crashed = false;
+        let mut started = Instant::now();
         let mut buffer = Vec::new();
 
         loop {
-            let n = tokio::select! {
-                n = read_batch(&mut receiver, &mut buffer, Duration::from_millis(100)) => n,
-                status = executable.wait() => {
-                    return Ok(status?.code().map(|code| ExitCode::from(code as u8)).unwrap_or_default())
+            let changed_files: BTreeSet<PathBuf> = tokio::select! {
+                n = read_batch(&mut receiver, &mut buffer, Duration::from_millis(100)) => {
+                    if n == 0 {
+                        return Err(anyhow!("file notifier failed"));
+                    }
+
+                    let changed_files: BTreeSet<PathBuf> = buffer
+                        .drain(..n)
+                        .filter_map(|event| {
+                            let path = event.paths.first()?;
+
+                            if path != &path.with_extension("rs") {
+                                return None;
+                            }
+
+                            Some(event.paths)
+                        })
+                        .flatten()
+                        .collect();
+
+                    if changed_files.is_empty() {
+                        continue;
+                    }
+
+                    changed_files
+                }
+                Some(new_connection) = connections.recv() => {
+                    connection = Some(new_connection);
+                    continue;
+                }
+                status = executable.wait(), if !crashed => {
+                    let status = status?;
+
+                    if !self.auto_restart || status.success() {
+                        return Ok(status.code().map(|code| ExitCode::from(code as u8)).unwrap_or_default());
+                    }
+
+                    crashed = true;
+                    connection = None;
+
+                    // A crash right after starting would crash again on restart.
+                    if started.elapsed() < CRASH_LOOP_WINDOW {
+                        log::error!(
+                            "The app crashed right after starting ({status}). \
+                            Waiting for a change to restart it."
+                        );
+                        continue;
+                    }
+
+                    log::warn!("The app crashed ({status}). Restarting.");
+                    BTreeSet::new()
                 }
             };
 
-            if n == 0 {
-                return Err(anyhow!("file notifier failed"));
-            }
+            // A change outside of the target's own sources lives in another crate, which
+            // hotpatching cannot reach. Until a restart succeeds, patching would build
+            // against libraries the running app does not have.
+            needs_restart = needs_restart
+                || crashed
+                || changed_files
+                    .iter()
+                    .any(|file| !file.starts_with(&self.crate_src_dir));
 
-            let changed_files: BTreeSet<PathBuf> = buffer
-                .drain(..n)
-                .filter_map(|event| {
-                    let path = event.paths.first()?;
+            let start = Instant::now();
 
-                    if path != &path.with_extension("rs") {
-                        return None;
+            if needs_restart {
+                let _ = self.gctx.shell().status(
+                    "Rebuilding",
+                    format!(
+                        "{} ({})",
+                        self.crate_target.name(),
+                        self.crate_dir.display(),
+                    ),
+                );
+
+                match self.restart(&mut executable).await {
+                    Ok(Some(new_build)) => {
+                        build = new_build;
+                        connection = None;
+                        started = Instant::now();
                     }
+                    // Nothing changed since the last build, so the app on disk is current.
+                    Ok(None) if crashed => {
+                        executable = self.spawn_executable()?;
+                        started = Instant::now();
+                    }
+                    Ok(None) => {}
+                    Err(error) if crashed => {
+                        log::error!("Rebuild failed, waiting for a change to retry: {error:#}");
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Rebuild failed, the app keeps running the old code: {error:#}"
+                        );
+                        continue;
+                    }
+                }
 
-                    Some(event.paths)
-                })
-                .flatten()
-                .collect();
-
-            if changed_files.is_empty() {
+                crashed = false;
+                needs_restart = false;
+                self.status_finished(start);
                 continue;
             }
+
+            let Some(active_connection) = connection.as_mut() else {
+                log::warn!(
+                    "Skipping patch: the app is not connected. \
+                    Is it built with hot reloading enabled (e.g. iced's `hot` feature)?"
+                );
+                continue;
+            };
 
             let _ = self.gctx.shell().status(
                 "Patching",
@@ -417,29 +554,125 @@ impl Server {
                 ),
             );
 
-            let start = Instant::now();
-
-            match self.patch(&build, changed_files, &mut connection).await {
-                Ok(()) => {
-                    let _ = self.gctx.shell().status(
-                        "Finished",
-                        format!(
-                            "`{}` profile target(s) in {:.2}s",
-                            self.profile,
-                            start.elapsed().as_millis() as f32 / 1_000.0
-                        ),
-                    );
-                }
+            let jump_table = match self
+                .patch(
+                    &build,
+                    changed_files,
+                    active_connection.aslr_reference() as u64,
+                )
+                .await
+            {
+                Ok(jump_table) => jump_table,
                 Err(error) => {
-                    log::error!("{error}");
+                    log::error!("Patch failed: {error:#}");
+                    continue;
+                }
+            };
+
+            match active_connection.patch(&jump_table).await {
+                Ok(()) => self.status_finished(start),
+                Err(error) => {
+                    log::error!("Lost connection to the app: {error:#}");
+                    connection = None;
                 }
             }
         }
     }
 
+    fn status_finished(&self, start: Instant) {
+        let _ = self.gctx.shell().status(
+            "Finished",
+            format!(
+                "`{}` profile target(s) in {:.2}s",
+                self.profile,
+                start.elapsed().as_millis() as f32 / 1_000.0
+            ),
+        );
+    }
+
+    /// Remove the files of earlier patches that `should_remove` picks.
+    ///
+    /// A patch is never needed again once the app that loaded it is gone, and its PDB alone can
+    /// be hundreds of megabytes.
+    fn remove_patch_files(&self, should_remove: impl Fn(&Path) -> bool) {
+        let prefix = format!("lib{}-patch-", self.executable_name());
+
+        let Ok(entries) = std::fs::read_dir(self.exe_dir()) else {
+            return;
+        };
+
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let is_patch = path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix));
+
+            if is_patch && should_remove(&path) {
+                _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// `-Csave-temps` keeps the LLVM bitcode of every build next to its object files. Nothing
+    /// reads it, and it adds up to gigabytes over a session.
+    fn remove_saved_bitcode(&self, object_dir: &Path) {
+        let prefix = format!("{}.", self.crate_target.crate_name());
+
+        let Ok(entries) = std::fs::read_dir(object_dir) else {
+            return;
+        };
+
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let is_bitcode = path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".bc")
+            });
+
+            if is_bitcode {
+                _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn spawn_executable(&self) -> Result<process::Child> {
+        // None of our apps is running, so no patch is loaded anymore.
+        self.remove_patch_files(|_| true);
+
+        Ok(process::Command::new(self.main_exe())
+            .args(&self.exe_args)
+            .kill_on_drop(true)
+            .spawn()?)
+    }
+
+    /// Run a full build and, if anything changed, replace the running app with the new one.
+    ///
+    /// The old app keeps running while compiling, so a failed build leaves it untouched.
+    async fn restart(&self, executable: &mut process::Child) -> Result<Option<Build>> {
+        let mut build = self.cargo_build(&BuildMode::Fat).await?;
+
+        if build.is_fresh {
+            return Ok(None);
+        }
+
+        executable
+            .kill()
+            .await
+            .context("Failed to stop the running app")?;
+
+        self.write_executable(&build.exe)
+            .await
+            .context("Failed to write main executable")?;
+
+        build.patch_cache = Some(Arc::new(self.create_patch_cache(&build.exe).await?));
+        *executable = self.spawn_executable()?;
+
+        Ok(Some(build))
+    }
+
     async fn build(&self, mode: BuildMode) -> Result<Build> {
         // Run the cargo build to produce our artifacts
+        let compile_start = Instant::now();
         let mut build = self.cargo_build(&mode).await?;
+        log::debug!("Compiled in {:.2?}", compile_start.elapsed());
 
         // Write the build artifacts to the bundle on the disk
         match &mode {
@@ -449,8 +682,10 @@ impl Server {
                 rustc_args,
                 ..
             } => {
+                let link_start = Instant::now();
                 self.write_patch(*aslr_reference, &mut build, cache, rustc_args)
                     .await?;
+                log::debug!("Linked patch in {:.2?}", link_start.elapsed());
             }
 
             BuildMode::Fat => {
@@ -476,26 +711,40 @@ impl Server {
         &self,
         build: &Build,
         changed_files: BTreeSet<PathBuf>,
-        connection: &mut server::Connection,
-    ) -> Result<()> {
+        aslr_reference: u64,
+    ) -> Result<JumpTable> {
         let patch = self
             .build(BuildMode::Thin {
                 rustc_args: build.direct_rustc.clone(),
                 changed_files: changed_files.into_iter().collect(),
-                aslr_reference: connection.aslr_reference() as u64,
+                aslr_reference,
                 cache: build.patch_cache.clone().unwrap(),
             })
             .await?;
 
+        let jump_table_start = Instant::now();
         let jump_table = hotpatch::create_jump_table(
             &self.patch_exe(patch.time_start),
             &self.triple,
             build.patch_cache.as_ref().unwrap(),
         )?;
+        log::debug!(
+            "Created jump table ({} entries) in {:.2?}",
+            jump_table.map.len(),
+            jump_table_start.elapsed()
+        );
 
-        connection.patch(&jump_table).await?;
+        // Older patches stay loaded, but only the newest one runs and is worth debugging.
+        let current_pdb = self.patch_exe(patch.time_start).with_extension("pdb");
+        self.remove_patch_files(|path| {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("lib" | "exp") => true,
+                Some("pdb") => path != current_pdb,
+                _ => false,
+            }
+        });
 
-        Ok(())
+        Ok(jump_table)
     }
 
     async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
@@ -623,7 +872,7 @@ impl Server {
                 Message::BuildFinished(finished) => {
                     if !finished.success {
                         return Err(anyhow::anyhow!(
-                            "Cargo build failed, signaled by the compiler. Toggle tracing mode (press `t`) for more information."
+                            "Cargo build failed, signaled by the compiler. Rerun with `-v` for more information."
                         ));
                     }
                 }
@@ -657,7 +906,9 @@ impl Server {
             .map(|s| s.to_string())
             .collect::<Vec<_>>();
 
-        let exe = output_location.context("Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.")?;
+        let exe = output_location.context(
+            "Cargo build failed - no output location. Rerun with `-v` for more information.",
+        )?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
         if matches!(mode, BuildMode::Fat) && has_compiled {
@@ -783,13 +1034,19 @@ impl Server {
         if self.triple.architecture != Architecture::Wasm32
             && self.triple.architecture != Architecture::Wasm64
         {
+            let stub_start = Instant::now();
             let stub_bytes = hotpatch::create_undefined_symbol_stub(
                 cache,
                 &object_files,
                 &self.triple,
                 aslr_reference,
             )
-            .expect("failed to resolve patch symbols");
+            .context("Failed to resolve patch symbols")?;
+            log::debug!(
+                "Resolved symbols of {} object files in {:.2?}",
+                object_files.len(),
+                stub_start.elapsed()
+            );
 
             // Currently we're dropping stub.o in the exe dir, but should probably just move to a tempfile?
             let patch_file = self.main_exe().with_file_name("stub.o");
@@ -836,12 +1093,14 @@ impl Server {
         //
         // We dump its output directly into the patch exe location which is different than how rustc
         // does it since it uses llvm-objcopy into the `target/debug/` folder.
+        let linker_start = Instant::now();
         let res = tokio::process::Command::new(linker)
             .args(out_args)
             .env_clear()
             .envs(rustc_args.envs.iter().map(|(k, v)| (k, v)))
             .output()
             .await?;
+        log::debug!("Ran the linker in {:.2?}", linker_start.elapsed());
 
         if !res.stderr.is_empty() {
             let errs = String::from_utf8_lossy(&res.stderr);
@@ -866,6 +1125,10 @@ impl Server {
 
         // Clean up the temps manually
         // todo: we might want to keep them around for debugging purposes
+        if let Some(object_dir) = object_files.first().and_then(|file| file.parent()) {
+            self.remove_saved_bitcode(object_dir);
+        }
+
         for file in object_files {
             _ = std::fs::remove_file(file);
         }
@@ -1417,6 +1680,14 @@ impl Server {
         }
 
         // Clean up the temps manually
+        if let Some(object_dir) = args
+            .iter()
+            .find(|arg| arg.ends_with(".rcgu.o"))
+            .and_then(|file| Path::new(file).parent())
+        {
+            self.remove_saved_bitcode(object_dir);
+        }
+
         for f in args.iter().filter(|arg| arg.ends_with(".rcgu.o")) {
             _ = std::fs::remove_file(f);
         }
@@ -1695,13 +1966,8 @@ impl Server {
         cargo_args.push("--".to_string());
         cargo_args.extend(self.extra_rustc_args.clone());
 
-        if cfg!(target_os = "windows") {
-            // On windows, we pass /SUBSYSTEM:WINDOWS to prevent a console from appearing
-            cargo_args.push("-Clink-arg=/SUBSYSTEM:WINDOWS".to_string());
-            // We also need to set the entry point to mainCRTStartup to avoid windows looking
-            // for a WinMain function
-            cargo_args.push("-Clink-arg=/ENTRY:mainCRTStartup".to_string());
-        }
+        // The Windows subsystem is left to the app (`#![windows_subsystem]`), like `cargo run` does.
+        // Forcing `/SUBSYSTEM:WINDOWS` would hide the output of console apps.
 
         // TODO
         // The bundle splitter needs relocation data to create a call-graph.
@@ -1877,6 +2143,51 @@ impl Server {
     }
 }
 
+fn src_dir(target: &Target) -> Option<PathBuf> {
+    Some(target.src_path().path()?.parent()?.to_path_buf())
+}
+
+/// Library source directories of every workspace member the main package depends on,
+/// directly or through other members. Dev-dependencies are skipped.
+///
+/// The main package itself is not included: its source directory is hotpatched instead.
+fn dependency_src_dirs(workspace: &Workspace<'_>, main_package: &Package) -> Vec<PathBuf> {
+    let members: HashMap<_, _> = workspace
+        .members()
+        .map(|package| (package.name(), package))
+        .collect();
+
+    let mut seen = HashSet::new();
+    let mut pending = vec![main_package];
+    let mut dirs = BTreeSet::new();
+
+    while let Some(package) = pending.pop() {
+        if !seen.insert(package.name()) {
+            continue;
+        }
+
+        if package.name() != main_package.name() {
+            dirs.extend(
+                package
+                    .targets()
+                    .iter()
+                    .filter(|target| target.is_lib())
+                    .filter_map(src_dir),
+            );
+        }
+
+        pending.extend(
+            package
+                .dependencies()
+                .iter()
+                .filter(|dependency| dependency.kind() != DepKind::Development)
+                .filter_map(|dependency| members.get(&dependency.package_name()).copied()),
+        );
+    }
+
+    dirs.into_iter().collect()
+}
+
 fn select_ranlib() -> Option<PathBuf> {
     // prefer the modern llvm-ranlib if they have it
     which::which("llvm-ranlib")
@@ -1887,6 +2198,29 @@ fn select_ranlib() -> Option<PathBuf> {
 fn path_to_me() -> Result<PathBuf> {
     dunce::canonicalize(std::env::current_exe().context("Failed to find cargo-hot")?)
         .context("Failed to find cargo-hot")
+}
+
+/// Accept app connections in the background, so a restarted or reconnecting app
+/// can always reach us, and waiting for one never blocks the main loop.
+fn accept_connections(mut server: server::Server) -> mpsc::Receiver<server::Connection> {
+    let (sender, receiver) = mpsc::channel(1);
+
+    drop(tokio::spawn(async move {
+        loop {
+            match server.accept().await {
+                Ok(connection) => {
+                    log::debug!("App connected");
+
+                    if sender.send(connection).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => log::warn!("Failed to accept app connection: {error:#}"),
+            }
+        }
+    }));
+
+    receiver
 }
 
 async fn read_batch<T>(
