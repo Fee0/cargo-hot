@@ -750,16 +750,36 @@ pub fn create_undefined_symbol_stub(
         .par_iter()
         .map(|path| -> Result<(Vec<String>, Vec<String>)> {
             let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
-            let file = File::parse(bytes.deref() as &[u8])?;
             let mut undefined = Vec::new();
             let mut defined = Vec::new();
 
-            for symbol in file.symbols() {
-                if symbol.is_undefined() {
-                    undefined.push(symbol.name()?.to_string());
-                } else if symbol.is_global() {
-                    defined.push(symbol.name()?.to_string());
+            let mut collect = |data: &[u8]| -> Result<()> {
+                let file = File::parse(data)?;
+
+                for symbol in file.symbols() {
+                    if symbol.is_undefined() {
+                        undefined.push(symbol.name()?.to_string());
+                    } else if symbol.is_global() {
+                        defined.push(symbol.name()?.to_string());
+                    }
                 }
+
+                Ok(())
+            };
+
+            // Rlibs are archives of object files, plus the crate's metadata.
+            if bytes.starts_with(b"!<arch>\n") {
+                let archive = object::read::archive::ArchiveFile::parse(bytes.deref())?;
+
+                for member in archive.members() {
+                    let member = member?;
+
+                    if member.name().ends_with(b".o") {
+                        collect(member.data(bytes.deref())?)?;
+                    }
+                }
+            } else {
+                collect(&bytes)?;
             }
 
             Ok((undefined, defined))
@@ -776,6 +796,7 @@ pub fn create_undefined_symbol_stub(
 
     let undefined_symbols: Vec<_> = undefined_symbols
         .difference(&defined_symbols)
+        .filter(|name| !is_module_local(name, triple))
         .cloned()
         .collect();
 
@@ -1466,4 +1487,37 @@ fn main_sentinel(triple: &Triple) -> &'static str {
 
         _ => "main",
     }
+}
+
+/// Symbols that every module must define for itself, which the linker takes from the C runtime
+/// instead of the original module.
+///
+/// On Windows, `_tls_index` is the slot of the module's own thread locals. The thread locals
+/// defined in a patch live in the patch's TLS block, so reading them through the original
+/// module's slot reads another module's block.
+fn is_module_local(name: &str, triple: &Triple) -> bool {
+    triple.operating_system == OperatingSystem::Windows
+        && (name.starts_with("_tls_") || name.starts_with("__tls_"))
+}
+
+/// The size of a PE image once loaded, from its optional header.
+pub fn pe_image_size(path: &Path) -> Result<u64> {
+    use std::io::Read;
+
+    let mut header = vec![0; 4096];
+    let read = std::fs::File::open(path)?.read(&mut header)?;
+    header.truncate(read);
+
+    let u32_at = |offset: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            header.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+
+    // DOS header -> "PE\0\0" -> 20 byte COFF header -> optional header, where `SizeOfImage`
+    // is at the same offset for PE32 and PE32+.
+    u32_at(0x3C)
+        .and_then(|pe| u32_at(pe as usize + 4 + 20 + 56))
+        .map(u64::from)
+        .ok_or_else(|| PatchError::InvalidModule(format!("{} is not a PE image", path.display())))
 }

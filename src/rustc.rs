@@ -4,10 +4,14 @@ use std::{
     path::PathBuf,
 };
 
-/// The environment variable indicating where the args file is located.
+/// The environment variable indicating where the args directory is located.
 ///
-/// When `dx-rustc` runs, it writes its arguments to this file.
+/// When the wrapper runs, it writes the arguments of each workspace crate to its own file in
+/// this directory (see [`args_file_name`]), so hot patches can replay them.
 pub const DX_RUSTC_WRAPPER_ENV_VAR: &str = "DX_RUSTC";
+
+/// The environment variable holding the workspace root. Only crates inside of it are recorded.
+pub const WORKSPACE_DIR_ENV_VAR: &str = "CARGO_HOT_WORKSPACE_DIR";
 
 /// Is `dx` being used as a rustc wrapper?
 ///
@@ -26,6 +30,39 @@ pub struct Args {
     pub args: Vec<String>,
     pub envs: Vec<(String, String)>,
     pub link_args: Vec<String>,
+}
+
+impl Args {
+    /// The value of a `--flag value` argument.
+    pub fn value(&self, flag: &str) -> Option<&str> {
+        self.args
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| self.args.get(index + 1))
+            .map(String::as_str)
+    }
+
+    /// The value of a `-C name=value` codegen option, in any of its spellings.
+    pub fn codegen_option(&self, name: &str) -> Option<&str> {
+        let prefix = format!("{name}=");
+
+        self.args.iter().enumerate().find_map(|(index, arg)| {
+            let option = match arg.strip_prefix("-C") {
+                Some("") => self.args.get(index + 1)?.as_str(),
+                Some(option) => option,
+                None => return None,
+            };
+
+            option.strip_prefix(&prefix)
+        })
+    }
+}
+
+/// The file a crate's arguments are recorded in: `{crate_name}.lib.json` or
+/// `{crate_name}.bin.json`, so the library and the binary of a package do not overwrite
+/// each other.
+pub fn args_file_name(crate_name: &str, is_lib: bool) -> String {
+    format!("{crate_name}.{}.json", if is_lib { "lib" } else { "bin" })
 }
 
 /// Check if the arguments indicate a linking step, including those in command files.
@@ -74,7 +111,7 @@ pub async fn run_rustc() {
             .await;
     }
 
-    let var_file: PathBuf = std::env::var(DX_RUSTC_WRAPPER_ENV_VAR)
+    let args_dir: PathBuf = std::env::var(DX_RUSTC_WRAPPER_ENV_VAR)
         .expect("DX_RUSTC not set")
         .into();
 
@@ -84,23 +121,31 @@ pub async fn run_rustc() {
         link_args: Default::default(),
     };
 
-    // A terrible hack to avoid writing non-sensical args when
-    // a build is completely fresh.
-    if rustc_args
-        .args
-        .iter()
-        .skip_while(|arg| *arg != "--crate-name")
-        .nth(1)
-        .is_some_and(|name| name != "___")
+    // Cargo runs `rustc -vV` and the like with the wrapper too; those have no crate name. A
+    // crate name of `___` is cargo probing the target, not building anything.
+    let crate_name = rustc_args
+        .value("--crate-name")
+        .filter(|name| *name != "___")
+        .map(str::to_owned);
+
+    let is_workspace_member = std::env::var_os("CARGO_MANIFEST_DIR")
+        .zip(std::env::var_os(WORKSPACE_DIR_ENV_VAR))
+        .is_some_and(|(manifest_dir, workspace_dir)| {
+            PathBuf::from(manifest_dir).starts_with(workspace_dir)
+        });
+
+    if let Some(crate_name) = crate_name
+        && is_workspace_member
     {
         rustc_args
             .envs
             .retain_mut(|(key, _)| key != "CARGO_MAKEFLAGS");
 
-        std::fs::create_dir_all(var_file.parent().expect("Failed to get parent dir"))
-            .expect("Failed to create parent dir");
+        let is_lib = matches!(rustc_args.value("--crate-type"), Some("lib" | "rlib"));
+
+        std::fs::create_dir_all(&args_dir).expect("Failed to create the rustc args directory");
         std::fs::write(
-            &var_file,
+            args_dir.join(args_file_name(&crate_name, is_lib)),
             serde_json::to_string(&rustc_args).expect("Failed to serialize rustc args"),
         )
         .expect("Failed to write rustc args to file");

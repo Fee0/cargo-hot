@@ -127,6 +127,13 @@ fn command() -> Command {
         ))
 }
 
+/// Windows maps images at multiples of 64 KiB.
+const PATCH_ALIGNMENT: u64 = 64 << 10;
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    value.div_ceil(alignment) * alignment
+}
+
 /// With `--auto-restart`, a crash this soon after starting is not restarted right away,
 /// since the new app would likely crash the same way. The next change restarts it.
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(5);
@@ -139,9 +146,9 @@ pub struct Server {
     crate_dir: PathBuf,
     /// Source directory of the target being run. Changes here are hotpatched.
     crate_src_dir: PathBuf,
-    /// Source directories of the workspace libraries the target depends on.
-    /// Changes here need a full rebuild and a restart.
-    dependency_src_dirs: Vec<PathBuf>,
+    /// The workspace libraries the target depends on, dependencies first. Their changes are
+    /// hotpatched too, by recompiling them and every crate between them and the target.
+    workspace_crates: Vec<WorkspaceCrate>,
     workspace_dir: PathBuf,
     profile: String,
     triple: Triple,
@@ -152,9 +159,34 @@ pub struct Server {
     extra_rustc_args: Vec<String>,
     verbose: u8,
     auto_restart: bool,
+    full_debuginfo: bool,
     no_default_features: bool,
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
+}
+
+/// A library of the workspace that the target depends on.
+#[derive(Debug)]
+struct WorkspaceCrate {
+    package: String,
+    crate_name: String,
+    src_dir: PathBuf,
+    is_proc_macro: bool,
+    /// Crate names of the workspace libraries this one depends on directly.
+    dependencies: Vec<String>,
+}
+
+/// Workspace libraries changed since the app was started, which every patch has to carry.
+#[derive(Debug, Default)]
+struct PatchState {
+    /// Recompiled since the app was started. A patch only replaces the functions it contains,
+    /// so leaving one of these out would bring its old code back.
+    modified: BTreeSet<String>,
+    /// Must be recompiled before the next patch, because their last compile failed or one of
+    /// their dependencies changed since.
+    pending: BTreeSet<String>,
+    /// Where the next patch is loaded, on Windows (see [`Server::patch_base`]).
+    next_patch_base: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +203,10 @@ pub enum BuildMode {
     Fat,
     Thin {
         rustc_args: rustc::Args,
+        /// Recompiled workspace libraries to link into the patch.
+        workspace_rlibs: Vec<PathBuf>,
+        /// The address the patch must be loaded at, if any.
+        patch_base: Option<u64>,
         changed_files: Vec<PathBuf>,
         aslr_reference: u64,
         cache: Arc<hotpatch::Cache>,
@@ -330,7 +366,7 @@ impl Server {
 
         let crate_dir = main_package.manifest_path().parent().unwrap().to_path_buf();
         let crate_src_dir = src_dir(&crate_target).context("Get source path")?;
-        let dependency_src_dirs = dependency_src_dirs(&workspace, main_package);
+        let workspace_crates = workspace_crates(&workspace, main_package);
         let workspace_dir = workspace.root_manifest().parent().unwrap().to_path_buf();
 
         Ok(Self {
@@ -339,7 +375,7 @@ impl Server {
             crate_target,
             crate_dir,
             crate_src_dir,
-            dependency_src_dirs,
+            workspace_crates,
             workspace_dir,
             profile,
             triple,
@@ -353,6 +389,7 @@ impl Server {
             extra_rustc_args,
             verbose: args.get_count("verbose"),
             auto_restart: args.flag("auto-restart"),
+            full_debuginfo: args.flag("full-debuginfo"),
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
             custom_linker,
@@ -367,7 +404,6 @@ impl Server {
         for file in [
             self.link_args_file(),
             self.link_err_file(),
-            self.rustc_wrapper_args_file(),
             self.windows_command_file(),
         ] {
             let _ = std::fs::OpenOptions::new()
@@ -421,11 +457,14 @@ impl Server {
         let mut build = self.build(BuildMode::Fat).await?;
         let mut executable = self.spawn_executable()?;
 
-        for dir in std::iter::once(&self.crate_src_dir).chain(&self.dependency_src_dirs) {
+        let crate_dirs = self.workspace_crates.iter().map(|krate| &krate.src_dir);
+
+        for dir in std::iter::once(&self.crate_src_dir).chain(crate_dirs) {
             watcher.watch(dir, notify::RecursiveMode::Recursive)?;
         }
 
         let mut connection = None;
+        let mut patch_state = PatchState::default();
         let mut needs_restart = false;
         let mut crashed = false;
         let mut started = Instant::now();
@@ -465,6 +504,10 @@ impl Server {
                 status = executable.wait(), if !crashed => {
                     let status = status?;
 
+                    if !status.success() {
+                        log::error!("The app exited with {status}");
+                    }
+
                     if !self.auto_restart || status.success() {
                         return Ok(status.code().map(|code| ExitCode::from(code as u8)).unwrap_or_default());
                     }
@@ -486,14 +529,10 @@ impl Server {
                 }
             };
 
-            // A change outside of the target's own sources lives in another crate, which
-            // hotpatching cannot reach. Until a restart succeeds, patching would build
-            // against libraries the running app does not have.
-            needs_restart = needs_restart
-                || crashed
-                || changed_files
-                    .iter()
-                    .any(|file| !file.starts_with(&self.crate_src_dir));
+            // Until a restart succeeds, patching would build against libraries the running
+            // app does not have.
+            let changed_crates = self.changed_crates(&changed_files);
+            needs_restart = needs_restart || crashed || changed_crates.is_none();
 
             let start = Instant::now();
 
@@ -511,6 +550,7 @@ impl Server {
                     Ok(Some(new_build)) => {
                         build = new_build;
                         connection = None;
+                        patch_state = PatchState::default();
                         started = Instant::now();
                     }
                     // Nothing changed since the last build, so the app on disk is current.
@@ -558,6 +598,8 @@ impl Server {
                 .patch(
                     &build,
                     changed_files,
+                    changed_crates.unwrap_or_default(),
+                    &mut patch_state,
                     active_connection.aslr_reference() as u64,
                 )
                 .await
@@ -577,6 +619,57 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// The workspace libraries the changed files belong to, or `None` if a change can only be
+    /// applied with a restart. Changes of the target's own sources need no library.
+    fn changed_crates(&self, changed_files: &BTreeSet<PathBuf>) -> Option<BTreeSet<String>> {
+        let mut changed_crates = BTreeSet::new();
+
+        for file in changed_files {
+            // Source directories can nest, so the innermost one owns the file.
+            let owner = self
+                .workspace_crates
+                .iter()
+                .filter(|krate| file.starts_with(&krate.src_dir))
+                .max_by_key(|krate| krate.src_dir.components().count());
+
+            let in_target = file.starts_with(&self.crate_src_dir);
+
+            let Some(krate) = owner else {
+                if in_target {
+                    continue;
+                }
+
+                log::debug!("{} is not part of a crate the app uses", file.display());
+                return None;
+            };
+
+            // A library and the target can share their source directory.
+            if in_target
+                && self.crate_src_dir.components().count() > krate.src_dir.components().count()
+            {
+                continue;
+            }
+
+            // A proc macro runs inside of the compiler, not the app.
+            if krate.is_proc_macro {
+                log::debug!("{} changed, which is a proc macro", krate.crate_name);
+                return None;
+            }
+
+            if !self.rustc_args_file(&krate.crate_name, true).exists() {
+                log::warn!(
+                    "Restarting, since the arguments to compile {} were not recorded",
+                    krate.crate_name
+                );
+                return None;
+            }
+
+            let _ = changed_crates.insert(krate.crate_name.clone());
+        }
+
+        Some(changed_crates)
     }
 
     fn status_finished(&self, start: Instant) {
@@ -680,11 +773,20 @@ impl Server {
                 aslr_reference,
                 cache,
                 rustc_args,
+                workspace_rlibs,
+                patch_base,
                 ..
             } => {
                 let link_start = Instant::now();
-                self.write_patch(*aslr_reference, &mut build, cache, rustc_args)
-                    .await?;
+                self.write_patch(
+                    *aslr_reference,
+                    &mut build,
+                    cache,
+                    rustc_args,
+                    workspace_rlibs,
+                    *patch_base,
+                )
+                .await?;
                 log::debug!("Linked patch in {:.2?}", link_start.elapsed());
             }
 
@@ -711,16 +813,37 @@ impl Server {
         &self,
         build: &Build,
         changed_files: BTreeSet<PathBuf>,
+        changed_crates: BTreeSet<String>,
+        state: &mut PatchState,
         aslr_reference: u64,
     ) -> Result<JumpTable> {
+        self.compile_workspace_crates(changed_crates, state).await?;
+
+        let workspace_rlibs = state
+            .modified
+            .iter()
+            .map(|crate_name| self.rlib(crate_name))
+            .collect::<Result<_>>()?;
+
+        let cache = build.patch_cache.clone().unwrap();
+        let patch_base = self.patch_base(&cache, state, aslr_reference)?;
+
         let patch = self
             .build(BuildMode::Thin {
                 rustc_args: build.direct_rustc.clone(),
+                workspace_rlibs,
+                patch_base,
                 changed_files: changed_files.into_iter().collect(),
                 aslr_reference,
                 cache: build.patch_cache.clone().unwrap(),
             })
             .await?;
+
+        // The next patch goes after this one, which stays loaded.
+        if let Some(base) = patch_base {
+            let size = hotpatch::pe_image_size(&self.patch_exe(patch.time_start))?;
+            state.next_patch_base = Some(align_up(base + size, PATCH_ALIGNMENT));
+        }
 
         let jump_table_start = Instant::now();
         let jump_table = hotpatch::create_jump_table(
@@ -747,6 +870,209 @@ impl Server {
         Ok(jump_table)
     }
 
+    /// Where to load the next patch on Windows: right after the app's executable, or after the
+    /// previous patch.
+    ///
+    /// x64 code reaches data with 32-bit offsets, also the data of the executable that a patch
+    /// uses. Those offsets are fixed when linking, so the patch must be loaded where it was
+    /// linked for, and within 2 GiB of the executable. Windows would otherwise load it at a
+    /// random address, usually much further away.
+    fn patch_base(
+        &self,
+        cache: &hotpatch::Cache,
+        state: &PatchState,
+        aslr_reference: u64,
+    ) -> Result<Option<u64>> {
+        if self.linker_flavor() != LinkerFlavor::Msvc {
+            return Ok(None);
+        }
+
+        let main = cache
+            .symbol_table
+            .get("main")
+            .context("No `main` in the executable")?;
+
+        let exe_base = aslr_reference - main.address;
+        let exe_end = exe_base + hotpatch::pe_image_size(&self.main_exe())?;
+        let base = state
+            .next_patch_base
+            .unwrap_or_else(|| align_up(exe_end, PATCH_ALIGNMENT));
+
+        // Patches are rarely bigger than this, and the last byte must still be in reach.
+        const MAX_PATCH_SIZE: u64 = 256 << 20;
+
+        if base + MAX_PATCH_SIZE - exe_base > 2 << 30 {
+            log::warn!(
+                "The patches loaded so far fill the memory next to the app, \
+                restart it if patching starts to fail"
+            );
+        }
+
+        Ok(Some(base))
+    }
+
+    /// Recompile the changed workspace libraries and every library depending on them, in place.
+    ///
+    /// The target compiles against the libraries on disk, and rustc refuses to mix a recompiled
+    /// library with dependents compiled against its old version. Their code is part of the
+    /// patch, so the generic and inlined code they took from a changed library is updated too.
+    ///
+    /// Crates whose dependencies are all compiled are compiled in parallel.
+    async fn compile_workspace_crates(
+        &self,
+        changed_crates: BTreeSet<String>,
+        state: &mut PatchState,
+    ) -> Result<()> {
+        // `workspace_crates` lists dependencies first, so one pass finds every dependent.
+        let mut stale = changed_crates;
+        stale.append(&mut state.pending);
+
+        for krate in &self.workspace_crates {
+            if krate
+                .dependencies
+                .iter()
+                .any(|dependency| stale.contains(dependency))
+            {
+                let _ = stale.insert(krate.crate_name.clone());
+            }
+        }
+
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        let mut compiling = tokio::task::JoinSet::new();
+        let mut waiting: Vec<&WorkspaceCrate> = self
+            .workspace_crates
+            .iter()
+            .filter(|krate| stale.contains(&krate.crate_name))
+            .collect();
+
+        let result = loop {
+            let (ready, blocked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|krate| {
+                !krate
+                    .dependencies
+                    .iter()
+                    .any(|dependency| stale.contains(dependency))
+            });
+
+            waiting = blocked;
+
+            for krate in ready {
+                let crate_name = krate.crate_name.clone();
+                let command = self.workspace_crate_command(&crate_name);
+
+                let _ = compiling.spawn(async move {
+                    let result = match command {
+                        Ok(command) => compile_workspace_crate(&crate_name, command).await,
+                        Err(error) => Err(error),
+                    };
+
+                    (crate_name, result)
+                });
+            }
+
+            let Some(compiled) = compiling.join_next().await else {
+                break Ok(());
+            };
+
+            let (crate_name, result) = compiled?;
+
+            if let Err(error) = result {
+                break Err(error);
+            }
+
+            let _ = stale.remove(&crate_name);
+            let _ = state.modified.insert(crate_name);
+        };
+
+        // A dependent compiled after a failure would build against outdated libraries, so
+        // whatever has not finished is compiled again next time.
+        compiling.shutdown().await;
+        state.pending = stale;
+
+        result?;
+
+        log::debug!("Compiled workspace crates in {:.2?}", start.elapsed());
+
+        Ok(())
+    }
+
+    /// Replay the recorded rustc invocation of a workspace library.
+    fn workspace_crate_command(&self, crate_name: &str) -> Result<process::Command> {
+        let args = self
+            .read_rustc_args(crate_name, true)
+            .with_context(|| format!("The arguments to compile {crate_name} were not recorded"))?;
+
+        let mut command = process::Command::new("rustc");
+
+        let _ = command
+            .current_dir(&self.workspace_dir)
+            .env_clear()
+            .envs(
+                args.envs
+                    .iter()
+                    .filter(|(key, _)| {
+                        ![
+                            "RUSTC_WRAPPER",
+                            "RUSTC_WORKSPACE_WRAPPER",
+                            rustc::DX_RUSTC_WRAPPER_ENV_VAR,
+                            rustc::WORKSPACE_DIR_ENV_VAR,
+                        ]
+                        .contains(&key.as_str())
+                            && !key.starts_with("DX_LINK")
+                    })
+                    .cloned(),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        // Like the target, the libraries' code ends up in every patch, and full debug info
+        // makes linking much slower.
+        if self.full_debuginfo {
+            let _ = command.args(&args.args[1..]);
+        } else {
+            // Other flags invalidate the incremental cache of cargo's builds, so patches keep
+            // their own. Otherwise, every patch after a restart and every restart after a patch
+            // would compile the crate from scratch.
+            let mut replay_args = args.args[1..].to_vec();
+
+            for arg in &mut replay_args {
+                for prefix in ["incremental=", "-Cincremental="] {
+                    if let Some(dir) = arg.strip_prefix(prefix) {
+                        *arg = format!("{prefix}{dir}-cargo-hot");
+                    }
+                }
+            }
+
+            let _ = command
+                .args(replay_args)
+                .arg("-Cdebuginfo=line-tables-only");
+        }
+
+        Ok(command)
+    }
+
+    /// The rlib a workspace library compiles to, as named by its recorded arguments.
+    fn rlib(&self, crate_name: &str) -> Result<PathBuf> {
+        let args = self
+            .read_rustc_args(crate_name, true)
+            .with_context(|| format!("The arguments to compile {crate_name} were not recorded"))?;
+
+        let out_dir = args
+            .value("--out-dir")
+            .with_context(|| format!("No `--out-dir` in the arguments of {crate_name}"))?;
+
+        let extra_filename = args.codegen_option("extra-filename").unwrap_or_default();
+
+        Ok(self
+            .workspace_dir
+            .join(out_dir)
+            .join(format!("lib{crate_name}{extra_filename}.rlib")))
+    }
+
     async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
         // TODO: Wasm
         let exe = exe.to_path_buf();
@@ -769,6 +1095,11 @@ impl Server {
         use tokio::io::AsyncBufReadExt;
 
         let time_start = SystemTime::now();
+
+        if matches!(mode, BuildMode::Fat) {
+            self.reset_unrecorded_fingerprints();
+        }
+
         let mut cmd = self.build_command(mode)?;
 
         log::debug!("Executing cargo for {}", self.triple);
@@ -880,13 +1211,10 @@ impl Server {
             }
         }
 
-        // Accumulate the rustc args from the wrapper, if they exist and can be parsed.
-        let mut direct_rustc = rustc::Args::default();
-        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file())
-            && let Ok(res) = serde_json::from_str(&res)
-        {
-            direct_rustc = res;
-        }
+        // The target's rustc args, as recorded by the wrapper.
+        let mut direct_rustc = self
+            .read_rustc_args(&self.crate_target.crate_name(), false)
+            .unwrap_or_default();
 
         // If there's any warnings from the linker, we should print them out
         if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file())
@@ -947,6 +1275,8 @@ impl Server {
         build: &mut Build,
         cache: &Arc<hotpatch::Cache>,
         rustc_args: &rustc::Args,
+        workspace_rlibs: &[PathBuf],
+        patch_base: Option<u64>,
     ) -> anyhow::Result<()> {
         log::debug!(
             "Original builds for patch: {}",
@@ -1011,12 +1341,17 @@ impl Server {
         //     -Wl,-all_load
         // ```
         let mut dylibs = vec![];
-        let mut object_files = args
+        let temp_objects = args
             .iter()
             .filter(|arg| arg.ends_with(".rcgu.o"))
             .sorted()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
+
+        // The recompiled workspace libraries are linked as archives, so only the code that the
+        // target reaches is pulled in. Their rlibs are kept, unlike the target's objects.
+        let mut object_files = temp_objects.clone();
+        object_files.extend(workspace_rlibs.iter().cloned());
 
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
@@ -1077,6 +1412,12 @@ impl Server {
         out_args.extend(object_files.iter().map(Into::into));
         out_args.extend(dylibs.iter().map(Into::into));
         out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
+
+        if let Some(base) = patch_base {
+            // A fixed base keeps Windows from moving the patch.
+            out_args.push(format!("/BASE:{base:#x}").into());
+            out_args.push("/DYNAMICBASE:NO".into());
+        }
         out_args.extend(out_arg.iter().map(Into::into));
 
         if cfg!(windows) {
@@ -1125,13 +1466,15 @@ impl Server {
 
         // Clean up the temps manually
         // todo: we might want to keep them around for debugging purposes
-        if let Some(object_dir) = object_files.first().and_then(|file| file.parent()) {
+        if let Some(object_dir) = temp_objects.first().and_then(|file| file.parent()) {
             self.remove_saved_bitcode(object_dir);
         }
 
-        for file in object_files {
+        for file in temp_objects {
             _ = std::fs::remove_file(file);
         }
+
+        _ = std::fs::remove_file(self.main_exe().with_file_name("stub.o"));
 
         Ok(())
     }
@@ -1900,14 +2243,16 @@ impl Server {
                     .envs(self.cargo_build_env_vars(mode)?);
 
                 if mode == &BuildMode::Fat {
+                    std::fs::create_dir_all(self.rustc_args_dir())?;
+
                     let _ = cmd
                         .env(
                             rustc::DX_RUSTC_WRAPPER_ENV_VAR,
-                            dunce::canonicalize(self.rustc_wrapper_args_file())
-                                .unwrap()
+                            dunce::canonicalize(self.rustc_args_dir())?
                                 .display()
                                 .to_string(),
                         )
+                        .env(rustc::WORKSPACE_DIR_ENV_VAR, &self.workspace_dir)
                         .env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
                 }
 
@@ -2134,8 +2479,89 @@ impl Server {
         self.exe_dir().join("link_err.txt")
     }
 
-    fn rustc_wrapper_args_file(&self) -> PathBuf {
-        self.exe_dir().join("rustc_wrapper_args.txt")
+    /// Where the rustc wrapper records the arguments of each workspace crate.
+    ///
+    /// Each set of features gets its own directory: cargo keeps the artifacts of every set it
+    /// built, and does not recompile, so does not record again, a crate that it has artifacts
+    /// for.
+    fn rustc_args_dir(&self) -> PathBuf {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        (&self.features, self.no_default_features, &self.package).hash(&mut hasher);
+
+        self.exe_dir()
+            .join(format!("rustc-args-{:016x}", hasher.finish()))
+    }
+
+    fn rustc_args_file(&self, crate_name: &str, is_lib: bool) -> PathBuf {
+        self.rustc_args_dir()
+            .join(rustc::args_file_name(crate_name, is_lib))
+    }
+
+    fn read_rustc_args(&self, crate_name: &str, is_lib: bool) -> Option<rustc::Args> {
+        let file = std::fs::read_to_string(self.rustc_args_file(crate_name, is_lib)).ok()?;
+
+        serde_json::from_str(&file).ok()
+    }
+
+    /// Make cargo recompile the workspace crates whose arguments were never recorded, and the
+    /// target itself, which has to be linked again to record its link arguments.
+    ///
+    /// Cargo skips crates that are up to date, so a crate built before `cargo hot` ran would
+    /// otherwise never pass through the wrapper. Removing a crate's fingerprint is what
+    /// `cargo clean -p` does too, and only that crate and its dependents are recompiled.
+    fn reset_unrecorded_fingerprints(&self) {
+        let mut packages: HashSet<&str> = self
+            .workspace_crates
+            .iter()
+            .filter(|krate| !krate.is_proc_macro)
+            .filter(|krate| !self.rustc_args_file(&krate.crate_name, true).exists())
+            .map(|krate| krate.package.as_str())
+            .collect();
+
+        if !self
+            .rustc_args_file(&self.crate_target.crate_name(), false)
+            .exists()
+        {
+            let _ = packages.insert(&self.package);
+        }
+
+        if packages.is_empty() {
+            return;
+        }
+
+        log::debug!("Recompiling to record their arguments: {packages:?}");
+
+        let profile_dir = match self.profile.as_str() {
+            "dev" | "test" => "debug",
+            "bench" => "release",
+            profile => profile,
+        };
+
+        let fingerprints = self
+            .target_dir
+            .as_path_unlocked()
+            .join(self.triple.to_string())
+            .join(profile_dir)
+            .join(".fingerprint");
+
+        for entry in std::fs::read_dir(fingerprints)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name();
+
+            let is_reset = name
+                .to_str()
+                .and_then(|name| name.rsplit_once('-'))
+                .is_some_and(|(package, _hash)| packages.contains(package));
+
+            if is_reset {
+                _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     fn windows_command_file(&self) -> PathBuf {
@@ -2147,45 +2573,121 @@ fn src_dir(target: &Target) -> Option<PathBuf> {
     Some(target.src_path().path()?.parent()?.to_path_buf())
 }
 
-/// Library source directories of every workspace member the main package depends on,
-/// directly or through other members. Dev-dependencies are skipped.
+/// The libraries of every workspace member the main package depends on, directly or through
+/// other members, ordered so that each crate comes after its dependencies. Dev and build
+/// dependencies are skipped, since they are not part of the app.
 ///
-/// The main package itself is not included: its source directory is hotpatched instead.
-fn dependency_src_dirs(workspace: &Workspace<'_>, main_package: &Package) -> Vec<PathBuf> {
+/// The main package's own library is included, but not its binary.
+fn workspace_crates(workspace: &Workspace<'_>, main_package: &Package) -> Vec<WorkspaceCrate> {
     let members: HashMap<_, _> = workspace
         .members()
         .map(|package| (package.name(), package))
         .collect();
 
-    let mut seen = HashSet::new();
-    let mut pending = vec![main_package];
-    let mut dirs = BTreeSet::new();
+    let library = |package: &Package| {
+        package
+            .targets()
+            .iter()
+            .find(|target| target.is_lib())
+            .cloned()
+    };
 
-    while let Some(package) = pending.pop() {
-        if !seen.insert(package.name()) {
-            continue;
+    let dependencies = |package: &Package| -> Vec<&Package> {
+        package
+            .dependencies()
+            .iter()
+            .filter(|dependency| dependency.kind() == DepKind::Normal)
+            .filter_map(|dependency| members.get(&dependency.package_name()).copied())
+            .collect()
+    };
+
+    // Depth first, adding a crate once all of its dependencies are in.
+    fn visit<'a>(
+        package: &'a Package,
+        dependencies: &dyn Fn(&'a Package) -> Vec<&'a Package>,
+        seen: &mut HashSet<&'a str>,
+        order: &mut Vec<&'a Package>,
+    ) {
+        if !seen.insert(package.name().as_str()) {
+            return;
         }
 
-        if package.name() != main_package.name() {
-            dirs.extend(
-                package
-                    .targets()
-                    .iter()
-                    .filter(|target| target.is_lib())
-                    .filter_map(src_dir),
-            );
+        for dependency in dependencies(package) {
+            visit(dependency, dependencies, seen, order);
         }
 
-        pending.extend(
-            package
-                .dependencies()
-                .iter()
-                .filter(|dependency| dependency.kind() != DepKind::Development)
-                .filter_map(|dependency| members.get(&dependency.package_name()).copied()),
-        );
+        order.push(package);
     }
 
-    dirs.into_iter().collect()
+    let mut order = Vec::new();
+    visit(main_package, &dependencies, &mut HashSet::new(), &mut order);
+
+    order
+        .into_iter()
+        .filter_map(|package| {
+            let target = library(package)?;
+
+            Some(WorkspaceCrate {
+                crate_name: target.crate_name(),
+                src_dir: src_dir(&target)?,
+                is_proc_macro: target.proc_macro(),
+                dependencies: dependencies(package)
+                    .into_iter()
+                    .filter_map(|dependency| Some(library(dependency)?.crate_name()))
+                    .collect(),
+                package: package.name().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Run a workspace library's compiler, showing its diagnostics.
+async fn compile_workspace_crate(crate_name: &str, mut command: process::Command) -> Result<()> {
+    use cargo_metadata::diagnostic::{Diagnostic, DiagnosticLevel};
+    use tokio::io::AsyncBufReadExt;
+
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to run rustc for {crate_name}"))?;
+
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+
+    loop {
+        let line = tokio::select! {
+            Ok(Some(line)) = stdout.next_line() => line,
+            Ok(Some(line)) = stderr.next_line() => line,
+            else => break,
+        };
+
+        // Cargo asks for JSON diagnostics, which come with a rendered version. Other JSON
+        // lines announce the artifacts.
+        match serde_json::from_str::<Diagnostic>(&line) {
+            Ok(diagnostic) => {
+                // The summary ("aborting due to ...") is left to the error below.
+                if diagnostic.spans.is_empty() && diagnostic.level != DiagnosticLevel::Warning {
+                    continue;
+                }
+
+                if let Some(rendered) = diagnostic.rendered {
+                    eprint!("{rendered}");
+                }
+            }
+            Err(_) if line.starts_with('{') => {}
+            Err(_) => eprintln!("{line}"),
+        }
+    }
+
+    let status = child.wait().await?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to compile {crate_name}"));
+    }
+
+    log::debug!("Compiled {crate_name} in {:.2?}", start.elapsed());
+
+    Ok(())
 }
 
 fn select_ranlib() -> Option<PathBuf> {
