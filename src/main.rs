@@ -204,6 +204,16 @@ struct PatchState {
     jump_table: subsecond_types::AddressMap,
 }
 
+impl PatchState {
+    /// Forget what the app had loaded, when it runs the same executable again. The libraries
+    /// recompiled since that executable was built still have to be part of every patch.
+    fn app_restarted(&mut self) {
+        self.next_patch_base = None;
+        self.patches.clear();
+        self.jump_table.clear();
+    }
+}
+
 /// A patch loaded by the app.
 #[derive(Debug)]
 struct LoadedPatch {
@@ -625,6 +635,7 @@ impl Server {
                     // Nothing changed since the last build, so the app on disk is current.
                     Ok(None) if crashed => {
                         executable = self.spawn_executable()?;
+                        patch_state.app_restarted();
                         started = Instant::now();
                     }
                     Ok(None) => {}
@@ -1867,6 +1878,7 @@ impl Server {
         }
 
         _ = std::fs::remove_file(self.main_exe().with_file_name("stub.o"));
+        _ = std::fs::remove_dir_all(self.shared_objects_dir());
 
         if !is_linked {
             return Err(anyhow!("Failed to link the patch: {}", errs.trim()));
