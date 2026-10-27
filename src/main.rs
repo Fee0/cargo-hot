@@ -134,6 +134,40 @@ fn command() -> Command {
         ))
 }
 
+/// The name of the function a mangled symbol stands for, without its path and generic arguments,
+/// or `None` for closures and async bodies, and symbols that are not Rust's.
+fn function_name(symbol: &str) -> Option<String> {
+    let demangled = format!("{:#}", rustc_demangle::try_demangle(symbol).ok()?);
+
+    // `path::{closure#0}`, `path::{async_fn_body#0}`, ...
+    if demangled.contains("::{") {
+        return None;
+    }
+
+    // `path::name::<T>`
+    let mut path = demangled.as_str();
+
+    if let Some(generic) = path.strip_suffix('>') {
+        let mut depth = 1;
+
+        for (index, character) in generic.char_indices().rev() {
+            match character {
+                '>' => depth += 1,
+                '<' => depth -= 1,
+                _ => {}
+            }
+
+            if depth == 0 {
+                path = generic[..index].strip_suffix("::").unwrap_or(path);
+                break;
+            }
+        }
+    }
+
+    // `<Type as Trait>::name`, `<Type>::name`, `path::name`
+    Some(path.rsplit("::").next().unwrap_or(path).to_owned())
+}
+
 /// The size of the jump that redirects a function.
 const JUMP_SIZE: u64 = 5;
 
@@ -205,6 +239,9 @@ struct PatchState {
     /// The content hashes of the object files of each library, as last linked whole into a
     /// patch. Later patches of only function bodies link just the object files that changed.
     linked_objects: HashMap<String, HashSet<u64>>,
+    /// The functions whose versions in the executable must not be redirected, by name (see
+    /// [`LoadedPatch::kept`]).
+    kept: HashSet<String>,
 }
 
 impl PatchState {
@@ -215,6 +252,7 @@ impl PatchState {
         self.patches.clear();
         self.jump_table.clear();
         self.linked_objects.clear();
+        self.kept.clear();
     }
 }
 
@@ -223,6 +261,9 @@ impl PatchState {
 struct LoadedPatch {
     base: u64,
     functions: HashMap<String, hotpatch::Function>,
+    /// The functions whose versions in this patch must not be redirected, by name, since a
+    /// later patch changed their signature: old code calls them with the old arguments.
+    kept: HashSet<String>,
 }
 
 /// A patch, ready to be sent to the app.
@@ -624,7 +665,10 @@ impl Server {
                 needs_restart = true;
             }
 
-            let only_bodies_changed = sources.only_bodies_changed(&changed_files);
+            let changes = layout::Changes {
+                only_bodies: sources.only_bodies_changed(&changed_files),
+                signatures: sources.changed_signatures(&changed_files),
+            };
             let changed_sources = layout::Sources::read_files(&changed_files);
 
             let start = Instant::now();
@@ -696,7 +740,7 @@ impl Server {
                     &build,
                     changed_files,
                     changed_crates.unwrap_or_default(),
-                    only_bodies_changed,
+                    changes,
                     &mut patch_state,
                     active_connection.aslr_reference() as u64,
                 )
@@ -953,7 +997,7 @@ impl Server {
         build: &Build,
         changed_files: BTreeSet<PathBuf>,
         changed_crates: BTreeSet<String>,
-        only_bodies_changed: bool,
+        changes: layout::Changes,
         state: &mut PatchState,
         aslr_reference: u64,
     ) -> Result<Patch> {
@@ -961,7 +1005,7 @@ impl Server {
         // old functions are redirected to the new ones. The first patch has the target's code,
         // for the jump table to point the app's entry points into a patch: iced takes entry
         // points that stay in the executable as a sign that types changed.
-        let compile_target = !(only_bodies_changed
+        let compile_target = !(changes.only_bodies
             && self.redirect
             && !state.jump_table.is_empty()
             && !changed_crates.is_empty()
@@ -1090,6 +1134,7 @@ impl Server {
                 &self.patch_exe(patch.time_start),
                 base,
                 aslr_reference,
+                changes.signatures,
             )?,
             _ => Vec::new(),
         };
@@ -1124,7 +1169,8 @@ impl Server {
     ///
     /// Closures and async bodies are left alone: values created by the old code, like stored
     /// callbacks and futures in flight, hold the captures of the old body, which the new body
-    /// may lay out differently.
+    /// may lay out differently. So are functions whose signature changed, which the old code
+    /// calls with the old arguments; the new code calls their new versions directly.
     fn detours(
         &self,
         cache: &hotpatch::Cache,
@@ -1132,6 +1178,7 @@ impl Server {
         module: &Path,
         base: u64,
         aslr_reference: u64,
+        changed_signatures: BTreeSet<String>,
     ) -> Result<Vec<Detour>> {
         let start = Instant::now();
         let functions =
@@ -1144,16 +1191,32 @@ impl Server {
                 .context("No `main` in the executable")?
                 .address;
 
-        let old_images = std::iter::once((exe_base, &cache.functions)).chain(
+        if !changed_signatures.is_empty() {
+            log::debug!(
+                "Keeping the old versions of {changed_signatures:?} for old code, \
+                since their signatures changed"
+            );
+        }
+
+        // Every version so far has the old signature.
+        state.kept.extend(changed_signatures.iter().cloned());
+
+        for patch in &mut state.patches {
+            patch.kept.extend(changed_signatures.iter().cloned());
+        }
+
+        let old_images = std::iter::once((exe_base, &cache.functions, &state.kept)).chain(
             state
                 .patches
                 .iter()
-                .map(|patch| (patch.base, &patch.functions)),
+                .map(|patch| (patch.base, &patch.functions, &patch.kept)),
         );
 
         let mut detours = Vec::new();
+        // Demangling is the slow part, so only functions with an old version are demangled.
+        let mut names: HashMap<&str, Option<String>> = HashMap::new();
 
-        for (old_base, old_functions) in old_images {
+        for (old_base, old_functions, kept) in old_images {
             for (name, function) in &functions {
                 let Some(old) = old_functions.get(name) else {
                     continue;
@@ -1161,6 +1224,15 @@ impl Server {
 
                 // Too small to hold the jump without overwriting the next function.
                 if old.size < JUMP_SIZE {
+                    continue;
+                }
+
+                let Some(function_name) = names.entry(name).or_insert_with(|| function_name(name))
+                else {
+                    continue;
+                };
+
+                if kept.contains(function_name) {
                     continue;
                 }
 
@@ -1178,24 +1250,6 @@ impl Server {
             }
         }
 
-        // Demangling is the slow part, so only the redirected functions are checked.
-        let is_body = |name: &str| {
-            rustc_demangle::try_demangle(name)
-                .map(|demangled| format!("{demangled:#}").contains("::{"))
-                .unwrap_or(true)
-        };
-
-        let targets: HashSet<u64> = detours.iter().map(|detour| detour.to).collect();
-
-        let bodies: HashSet<u64> = functions
-            .iter()
-            .filter(|(_, function)| targets.contains(&(base + function.rva)))
-            .filter(|(name, _)| is_body(name))
-            .map(|(_, function)| base + function.rva)
-            .collect();
-
-        detours.retain(|detour| !bodies.contains(&detour.to));
-
         log::debug!(
             "Found {} functions to redirect, of {} in the patch, in {:.2?}",
             detours.len(),
@@ -1203,7 +1257,11 @@ impl Server {
             start.elapsed()
         );
 
-        state.patches.push(LoadedPatch { base, functions });
+        state.patches.push(LoadedPatch {
+            base,
+            functions,
+            kept: HashSet::new(),
+        });
 
         Ok(detours)
     }
@@ -3296,4 +3354,36 @@ fn is_wsl() -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::function_name;
+
+    #[test]
+    fn function_names_are_found() {
+        let name = |symbol| function_name(symbol);
+
+        assert_eq!(
+            name("_RNvNtNtCs4yEraE8XvqB_6app_ui4dock12welcome_pane9sig_probe").as_deref(),
+            Some("sig_probe")
+        );
+        assert_eq!(
+            name("_RNvMsG_NtCs89r4j2vouvF_5alloc3vecINtB5_3VecNtNtNtCs4yEraE8XvqB_6app_ui4dock12welcome_pane7MessageE4pushBL_").as_deref(),
+            Some("push")
+        );
+        assert_eq!(
+            name("_RINvMNtNtCs4yEraE8XvqB_6app_ui6widget7tooltipINtB3_7TooltipNtNtNtB7_4dock12welcome_pane7MessageE3gapmEB7_").as_deref(),
+            Some("gap")
+        );
+        assert_eq!(
+            name("_RNvXs2_NtCs4yEraE8XvqB_6app_ui7vim_barNtB5_6WidthsNtNtCs9rw95XCWuke_4core3fmt5Debug3fmt").as_deref(),
+            Some("fmt")
+        );
+        assert_eq!(
+            name("_RNCNvNtNtCs4yEraE8XvqB_6app_ui4dock12welcome_pane11view_counts0B7_"),
+            None
+        );
+        assert_eq!(name("main"), None);
+    }
 }

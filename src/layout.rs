@@ -16,8 +16,17 @@ use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+
+/// How functions changed since the app last loaded code, which tells how to patch them.
+#[derive(Debug, Default)]
+pub struct Changes {
+    /// See [`Sources::only_bodies_changed`].
+    pub only_bodies: bool,
+    /// See [`Sources::changed_signatures`].
+    pub signatures: BTreeSet<String>,
+}
 
 /// The source files as the running app was built from them.
 #[derive(Debug, Default)]
@@ -124,6 +133,51 @@ impl Sources {
                 _ => false,
             }) && old.keys().all(|key| new.contains_key(key))
         })
+    }
+
+    /// The names of the functions whose signature changed in `changed_files` since they were
+    /// remembered. Old code calls them with the old arguments, which the new versions would
+    /// read wrongly.
+    pub fn changed_signatures<'a>(
+        &self,
+        changed_files: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+
+        for file in changed_files {
+            let (Some(old), Ok(new)) = (self.files.get(file), std::fs::read_to_string(file)) else {
+                continue;
+            };
+
+            if *old == new {
+                continue;
+            }
+
+            let (Some(old), Some(new)) = (items(old), items(&new)) else {
+                continue;
+            };
+
+            for (key, new) in &new {
+                if let (
+                    Some(Item::Function {
+                        signature: old_signature,
+                        ..
+                    }),
+                    Item::Function { signature, .. },
+                ) = (old.get(key), new)
+                    && old_signature != signature
+                {
+                    // Keys end with the function's name, and maybe a number telling apart
+                    // functions of the same path.
+                    let path = key.split(" #").next().unwrap_or(key);
+                    let name = path.rsplit("::").next().unwrap_or(path);
+
+                    let _ = names.insert(name.to_owned());
+                }
+            }
+        }
+
+        names
     }
 
     /// The current contents of `files`, to [`Sources::remember`] once the app runs them.
@@ -524,6 +578,41 @@ mod tests {
             "trait T { fn f(&self) -> u32 { 1 } }",
             "trait T { fn f(&self) -> u32 { 2 } }",
         ));
+    }
+
+    fn signatures(old: &str, new: &str) -> Vec<String> {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("lib.rs");
+
+        std::fs::write(&file, old).unwrap();
+        let sources = Sources::read([directory.path()]);
+        std::fs::write(&file, new).unwrap();
+
+        sources.changed_signatures([&file]).into_iter().collect()
+    }
+
+    #[test]
+    fn changed_signatures_are_named() {
+        assert_eq!(
+            signatures(
+                "fn f(a: u8) {} fn g() {}",
+                "fn f(a: u8, b: u8) {} fn g() {}"
+            ),
+            ["f"]
+        );
+        assert_eq!(
+            signatures(
+                "struct A; impl A { fn f(&self) -> u8 { 1 } }",
+                "struct A; impl A { fn f(&self) -> u16 { 1 } }",
+            ),
+            ["f"]
+        );
+        assert_eq!(
+            signatures("mod m { fn f() {} }", "mod m { fn f(x: u8) {} }"),
+            ["f"]
+        );
+        assert!(signatures("fn f() -> u8 { 1 }", "fn f() -> u8 { 2 }").is_empty());
+        assert!(signatures("fn f() {}", "fn f() {} fn g(x: u8) {}").is_empty());
     }
 
     #[test]
