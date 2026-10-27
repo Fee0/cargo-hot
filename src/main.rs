@@ -233,6 +233,8 @@ struct Patch {
 struct Detour {
     from: u64,
     to: u64,
+    /// The base of the image `from` is in.
+    image: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1103,6 +1105,7 @@ impl Server {
                 detours.push(Detour {
                     from: old_base + old.rva,
                     to: base + function.rva,
+                    image: old_base,
                 });
             }
         }
@@ -1156,7 +1159,7 @@ impl Server {
         tokio::task::spawn_blocking(move || {
             let mut detours: Vec<detour::Detour> = detours
                 .into_iter()
-                .map(|Detour { from, to }| detour::Detour { from, to })
+                .map(|Detour { from, to, image }| detour::Detour { from, to, image })
                 .collect();
 
             detour::load(pid, &module, base)?;

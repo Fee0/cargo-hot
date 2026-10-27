@@ -50,6 +50,10 @@ use windows_sys::Win32::System::Threading::{
 pub struct Detour {
     pub from: u64,
     pub to: u64,
+    /// The base of the image `from` is in. Jumps in different images are written separately,
+    /// since the memory between images may be unmapped, or hold data whose protection must not
+    /// change.
+    pub image: u64,
 }
 
 /// The size of a `jmp rel32`.
@@ -230,7 +234,10 @@ fn write(process: HANDLE, detours: &[Detour]) -> anyhow::Result<()> {
         let mut end = start + 1;
         let mut last = detours[start].from + JUMP_SIZE;
 
-        while end < detours.len() && detours[end].from <= last + MAX_GAP {
+        while end < detours.len()
+            && detours[end].image == detours[start].image
+            && detours[end].from <= last + MAX_GAP
+        {
             last = last.max(detours[end].from + JUMP_SIZE);
             end += 1;
         }
