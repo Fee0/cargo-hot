@@ -795,6 +795,8 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
 /// todo... we need to wire up the cache
 ///
 /// The members of `replaced_members` are skipped, since loose copies of them are linked instead.
+/// Functions of `patched_functions`, by their absolute address in earlier patches, resolve to
+/// those instead of the executable's versions, which may be outdated or missing.
 /// With `share_thread_locals`, the patch reads thread locals through the executable's TLS slot,
 /// and its thread locals sit at the offsets they have in the executable's TLS block (see
 /// [`crate::statics`]).
@@ -802,6 +804,7 @@ pub fn create_undefined_symbol_stub(
     cache: &Cache,
     incrementals: &[PathBuf],
     replaced_members: &HashMap<PathBuf, HashSet<Vec<u8>>>,
+    patched_functions: &HashMap<String, u64>,
     share_thread_locals: bool,
     triple: &Triple,
     aslr_reference: u64,
@@ -968,10 +971,23 @@ pub fn create_undefined_symbol_stub(
             continue;
         }
 
-        let Some(sym) = cache
+        let patched;
+        let sym = if let Some(address) = patched_functions.get(&name) {
+            patched = CachedSymbol {
+                address: address - aslr_offset,
+                kind: SymbolKind::Text,
+                is_undefined: false,
+                is_weak: false,
+                size: 0,
+                flags: SymbolFlags::None,
+            };
+            &patched
+        } else if let Some(sym) = cache
             .symbol_table
             .get(name.as_str().trim_start_matches("__imp_"))
-        else {
+        {
+            sym
+        } else {
             log::debug!("Symbol not found: {name}");
             continue;
         };

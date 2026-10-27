@@ -202,6 +202,9 @@ struct PatchState {
     patches: Vec<LoadedPatch>,
     /// The jump table of the last patch, with absolute addresses, on Windows.
     jump_table: subsecond_types::AddressMap,
+    /// The content hashes of the object files of each library, as last linked whole into a
+    /// patch. Later patches of only function bodies link just the object files that changed.
+    linked_objects: HashMap<String, HashSet<u64>>,
 }
 
 impl PatchState {
@@ -211,6 +214,7 @@ impl PatchState {
         self.next_patch_base = None;
         self.patches.clear();
         self.jump_table.clear();
+        self.linked_objects.clear();
     }
 }
 
@@ -226,6 +230,9 @@ struct Patch {
     jump_table: JumpTable,
     /// The jumps from old functions to the patched ones, once the app has loaded the patch.
     detours: Vec<Detour>,
+    /// The object files of the libraries linked whole, for [`PatchState::linked_objects`]
+    /// once the app runs the patch.
+    linked_objects: HashMap<String, HashSet<u64>>,
 }
 
 /// A jump from the entry of an old function to its new version (see `cargo_hot::detour`).
@@ -244,6 +251,8 @@ pub struct Build {
     direct_rustc: rustc::Args,
     time_start: SystemTime,
     patch_cache: Option<Arc<hotpatch::Cache>>,
+    /// The content hashes of the object files of each rlib linked whole into a patch.
+    linked_objects: HashMap<PathBuf, HashSet<u64>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -256,6 +265,12 @@ pub enum BuildMode {
         /// Whether to compile the target into the patch. Without it, the patch holds all of
         /// the libraries' code, which is redirected to.
         compile_target: bool,
+        /// The object files of each rlib, by content hash, that the app runs already, so
+        /// a patch without the target leaves them out.
+        linked_objects: Arc<HashMap<PathBuf, HashSet<u64>>>,
+        /// The functions of earlier patches, by absolute address, which the patch calls
+        /// instead of the executable's versions.
+        patched_functions: Arc<HashMap<String, u64>>,
         /// The address the patch must be loaded at, if any.
         patch_base: Option<u64>,
         changed_files: Vec<PathBuf>,
@@ -714,6 +729,7 @@ impl Server {
             match active_connection.patch(&patch.jump_table).await {
                 Ok(()) => {
                     sources.remember(changed_sources);
+                    patch_state.linked_objects.extend(patch.linked_objects);
                     self.status_finished(start);
                 }
                 Err(error) => {
@@ -899,6 +915,7 @@ impl Server {
                 direct_rustc: rustc_args.clone(),
                 time_start: SystemTime::now(),
                 patch_cache: None,
+                linked_objects: HashMap::new(),
             },
             mode => self.cargo_build(mode).await?,
         };
@@ -950,8 +967,20 @@ impl Server {
             && !changed_crates.is_empty()
             && !changed_files.iter().any(|file| self.is_target_file(file)));
 
-        let workspace_rlibs = if compile_target {
-            self.compile_workspace_crates(changed_crates, true, state)
+        // Compiling a library forgets which of its object files the app runs.
+        let linked_objects: HashMap<PathBuf, HashSet<u64>> = changed_crates
+            .iter()
+            .filter(|_| !compile_target)
+            .filter_map(|krate| {
+                Some((
+                    self.rlib(krate).ok()?,
+                    state.linked_objects.get(krate)?.clone(),
+                ))
+            })
+            .collect();
+
+        let workspace_rlibs: Vec<PathBuf> = if compile_target {
+            self.compile_workspace_crates(changed_crates.clone(), true, state)
                 .await?;
 
             state
@@ -974,17 +1003,47 @@ impl Server {
         let cache = build.patch_cache.clone().unwrap();
         let patch_base = self.patch_base(&cache, state, aslr_reference)?;
 
-        let patch = self
-            .build(BuildMode::Thin {
-                rustc_args: build.direct_rustc.clone(),
-                workspace_rlibs,
-                compile_target,
-                patch_base,
-                changed_files: changed_files.into_iter().collect(),
-                aslr_reference,
-                cache: build.patch_cache.clone().unwrap(),
+        // Later patches override earlier ones.
+        let patched_functions: HashMap<String, u64> = state
+            .patches
+            .iter()
+            .flat_map(|patch| {
+                patch
+                    .functions
+                    .iter()
+                    .map(|(name, function)| (name.clone(), patch.base + function.rva))
             })
-            .await?;
+            .collect();
+
+        let links_changes_only = !linked_objects.is_empty();
+        let mut mode = BuildMode::Thin {
+            rustc_args: build.direct_rustc.clone(),
+            workspace_rlibs,
+            compile_target,
+            linked_objects: Arc::new(linked_objects),
+            patched_functions: Arc::new(patched_functions),
+            patch_base,
+            changed_files: changed_files.into_iter().collect(),
+            aslr_reference,
+            cache: build.patch_cache.clone().unwrap(),
+        };
+
+        let patch = match self.build(mode.clone()).await {
+            // Code left out may define what the new code needs, like a static that only an
+            // earlier patch has.
+            Err(error) if links_changes_only => {
+                log::warn!(
+                    "Linking only the changed code failed, linking all of it instead: {error:#}"
+                );
+
+                if let BuildMode::Thin { linked_objects, .. } = &mut mode {
+                    *linked_objects = Arc::default();
+                }
+
+                self.build(mode).await?
+            }
+            result => result?,
+        };
 
         // The next patch goes after this one, which stays loaded.
         if let Some(base) = patch_base {
@@ -1045,9 +1104,18 @@ impl Server {
             }
         });
 
+        let linked_objects = changed_crates
+            .into_iter()
+            .filter_map(|krate| {
+                let objects = patch.linked_objects.get(&self.rlib(&krate).ok()?)?.clone();
+                Some((krate, objects))
+            })
+            .collect();
+
         Ok(Patch {
             jump_table,
             detours,
+            linked_objects,
         })
     }
 
@@ -1341,6 +1409,7 @@ impl Server {
 
             let _ = stale.remove(&crate_name);
             let _ = state.pending.remove(&crate_name);
+            let _ = state.linked_objects.remove(&crate_name);
             let _ = state.modified.insert(crate_name);
         };
 
@@ -1631,6 +1700,7 @@ impl Server {
             direct_rustc,
             time_start,
             patch_cache: None,
+            linked_objects: HashMap::new(),
         })
     }
 
@@ -1641,6 +1711,8 @@ impl Server {
             rustc_args,
             workspace_rlibs,
             compile_target,
+            linked_objects,
+            patched_functions,
             patch_base,
             ..
         } = mode
@@ -1724,13 +1796,14 @@ impl Server {
         // Without the target, nothing pulls the libraries' code out of their rlibs.
         let whole_rlibs = !compile_target;
 
-        let sharing = if self.triple.operating_system == OperatingSystem::Windows {
+        let mut sharing = if self.triple.operating_system == OperatingSystem::Windows {
             let start = Instant::now();
             let sharing = statics::share(
                 cache,
                 &temp_objects,
                 workspace_rlibs,
                 whole_rlibs,
+                linked_objects,
                 &self.shared_objects_dir(),
             )?;
 
@@ -1740,6 +1813,14 @@ impl Server {
                 start.elapsed()
             );
 
+            if !linked_objects.is_empty() {
+                log::debug!(
+                    "Linking {} changed object files of {}",
+                    sharing.objects.len(),
+                    sharing.members.values().map(HashSet::len).sum::<usize>()
+                );
+            }
+
             sharing
         } else {
             statics::Sharing::default()
@@ -1747,6 +1828,7 @@ impl Server {
 
         let mut object_files = temp_objects.clone();
         object_files.extend(sharing.objects.iter().cloned());
+        build.linked_objects = std::mem::take(&mut sharing.members);
 
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
@@ -1765,10 +1847,18 @@ impl Server {
             && self.triple.architecture != Architecture::Wasm64
         {
             let stub_start = Instant::now();
+            // Rlibs linked whole are linked as their object files, which may leave out some.
+            let inputs = if whole_rlibs {
+                object_files.clone()
+            } else {
+                [object_files.as_slice(), workspace_rlibs].concat()
+            };
+
             let stub_bytes = hotpatch::create_undefined_symbol_stub(
                 cache,
-                &[object_files.as_slice(), workspace_rlibs].concat(),
+                &inputs,
                 &sharing.replaced_members,
+                patched_functions,
                 sharing.thread_locals,
                 &self.triple,
                 aslr_reference,
@@ -1776,7 +1866,7 @@ impl Server {
             .context("Failed to resolve patch symbols")?;
             log::debug!(
                 "Resolved symbols of {} object files in {:.2?}",
-                object_files.len() + workspace_rlibs.len(),
+                inputs.len(),
                 stub_start.elapsed()
             );
 

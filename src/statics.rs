@@ -29,6 +29,8 @@ pub struct Sharing {
     pub replaced_members: HashMap<PathBuf, HashSet<Vec<u8>>>,
     /// Whether the patch uses the app's thread locals.
     pub thread_locals: bool,
+    /// The content hashes of the members of each rlib, with `whole_rlibs`.
+    pub members: HashMap<PathBuf, HashSet<u64>>,
     /// The number of shared statics and thread locals, for logging.
     pub count: usize,
 }
@@ -36,12 +38,14 @@ pub struct Sharing {
 /// Turn the statics of `objects` and of the members of `rlibs` that the app has into references.
 ///
 /// `objects` are rewritten in place, rlib members are copied to `out_dir` when they define a
-/// shared static, or always with `whole_rlibs`, which links all of their members.
+/// shared static, or always with `whole_rlibs`, which links all of their members except those
+/// whose content hash is in `linked`: the app runs their code already.
 pub fn share(
     cache: &Cache,
     objects: &[PathBuf],
     rlibs: &[PathBuf],
     whole_rlibs: bool,
+    linked: &HashMap<PathBuf, HashSet<u64>>,
     out_dir: &Path,
 ) -> anyhow::Result<Sharing> {
     let _ = std::fs::remove_dir_all(out_dir);
@@ -52,16 +56,31 @@ pub fn share(
         .map(|path| Ok((std::fs::read(path)?, path.clone(), None)));
 
     let mut members = Vec::new();
+    let mut hashes = HashMap::new();
 
     for rlib in rlibs {
         let bytes = std::fs::read(rlib)?;
         let archive = ArchiveFile::parse(bytes.as_slice())?;
+        let linked = linked.get(rlib);
 
         for (index, member) in archive.members().enumerate() {
             let member = member?;
 
             if !member.name().ends_with(b".o") {
                 continue;
+            }
+
+            if whole_rlibs {
+                let hash = hash(member.data(bytes.as_slice())?);
+
+                let _ = hashes
+                    .entry(rlib.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(hash);
+
+                if linked.is_some_and(|linked| linked.contains(&hash)) {
+                    continue;
+                }
             }
 
             let name = member.name().to_vec();
@@ -107,6 +126,7 @@ pub fn share(
 
     let mut sharing = Sharing {
         thread_locals: new_thread_local.is_none() && !cache.thread_locals.is_empty(),
+        members: hashes,
         ..Sharing::default()
     };
 
@@ -300,6 +320,16 @@ impl Coff {
         let characteristics = characteristics & !IMAGE_SCN_LNK_COMDAT;
         bytes[header + 36..header + 40].copy_from_slice(&characteristics.to_le_bytes());
     }
+}
+
+/// The hash of an object file's contents. Compiling a library again reproduces the object files
+/// of its unchanged code units byte for byte, though under new names.
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 fn read<const N: usize>(bytes: &[u8], offset: usize) -> anyhow::Result<[u8; N]> {
