@@ -2,6 +2,7 @@ use cargo_hot::Result;
 use cargo_hot::hotpatch;
 use cargo_hot::link::{self, LinkerFlavor};
 use cargo_hot::rustc;
+use cargo_hot::statics;
 use cargo_hot_protocol::server;
 
 use cargo::GlobalContext;
@@ -1076,8 +1077,16 @@ impl Server {
     async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
         // TODO: Wasm
         let exe = exe.to_path_buf();
+        let start = Instant::now();
+        let cache = hotpatch::Cache::new(&exe, &self.triple)?;
 
-        Ok(hotpatch::Cache::new(&exe, &self.triple)?)
+        log::debug!(
+            "Read {} symbols of the app in {:.2?}",
+            cache.symbol_table.len(),
+            start.elapsed()
+        );
+
+        Ok(cache)
     }
 
     async fn write_executable(&self, exe: &Path) -> Result<()> {
@@ -1348,10 +1357,28 @@ impl Server {
             .map(PathBuf::from)
             .collect::<Vec<_>>();
 
-        // The recompiled workspace libraries are linked as archives, so only the code that the
-        // target reaches is pulled in. Their rlibs are kept, unlike the target's objects.
+        let sharing = if self.triple.operating_system == OperatingSystem::Windows {
+            let start = Instant::now();
+            let sharing = statics::share(
+                cache,
+                &temp_objects,
+                workspace_rlibs,
+                &self.shared_objects_dir(),
+            )?;
+
+            log::debug!(
+                "Shared {} statics with the app in {:.2?}",
+                sharing.count,
+                start.elapsed()
+            );
+
+            sharing
+        } else {
+            statics::Sharing::default()
+        };
+
         let mut object_files = temp_objects.clone();
-        object_files.extend(workspace_rlibs.iter().cloned());
+        object_files.extend(sharing.objects.iter().cloned());
 
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
@@ -1372,14 +1399,16 @@ impl Server {
             let stub_start = Instant::now();
             let stub_bytes = hotpatch::create_undefined_symbol_stub(
                 cache,
-                &object_files,
+                &[object_files.as_slice(), workspace_rlibs].concat(),
+                &sharing.replaced_members,
+                sharing.thread_locals,
                 &self.triple,
                 aslr_reference,
             )
             .context("Failed to resolve patch symbols")?;
             log::debug!(
                 "Resolved symbols of {} object files in {:.2?}",
-                object_files.len(),
+                object_files.len() + workspace_rlibs.len(),
                 stub_start.elapsed()
             );
 
@@ -1410,6 +1439,13 @@ impl Server {
 
         let mut out_args: Vec<OsString> = vec![];
         out_args.extend(object_files.iter().map(Into::into));
+
+        // The recompiled workspace libraries are linked as archives, so only the code that the
+        // target reaches is pulled in. They come after the stub: the linker pulls in an archive
+        // member as soon as it defines a symbol that is undefined so far, and the stub defines
+        // the statics shared with the app, which members define too. Their rlibs are kept,
+        // unlike the target's objects.
+        out_args.extend(workspace_rlibs.iter().map(Into::into));
         out_args.extend(dylibs.iter().map(Into::into));
         out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
 
@@ -1942,6 +1978,10 @@ impl Server {
             LinkerFlavor::Msvc => {
                 // Prevent alsr from overflowing 32 bits
                 args.push("/HIGHENTROPYVA:NO".to_string());
+
+                // Unlike the PDB, the map lists the statics that are local to their object
+                // file, which patches share with the executable.
+                args.push(format!("/MAP:{}", exe.with_extension("map").display()));
 
                 // Export `main` so subsecond can use it for a reference point
                 args.push("/EXPORT:main".to_string());
@@ -2562,6 +2602,11 @@ impl Server {
                 _ = std::fs::remove_dir_all(entry.path());
             }
         }
+    }
+
+    /// Where the copies of rlib members that share statics with the app go.
+    fn shared_objects_dir(&self) -> PathBuf {
+        self.exe_dir().join("shared-objects")
     }
 
     fn windows_command_file(&self) -> PathBuf {

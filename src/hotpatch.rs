@@ -77,6 +77,14 @@ pub struct Cache {
 
     // ... native stuff
     pub symbol_table: HashMap<String, CachedSymbol>,
+
+    // ... windows stuff, from the linker's map (see [`LinkMap`])
+    /// The writable statics of the executable, with their RVA.
+    pub statics: HashMap<String, u64>,
+    /// The thread locals of the executable, with their offset in its TLS block.
+    pub thread_locals: HashMap<String, u64>,
+    /// The size of the executable's TLS block.
+    pub tls_size: u64,
 }
 
 pub struct CachedSymbol {
@@ -168,9 +176,39 @@ impl Cache {
                     }
                 }
 
+                let map_start = std::time::Instant::now();
+                let map = LinkMap::read(&original.with_extension("map")).unwrap_or_else(|error| {
+                    log::warn!("Patches will not share statics with the app: {error}");
+                    LinkMap::default()
+                });
+
+                log::debug!(
+                    "Read {} statics and {} thread locals from the linker map in {:.2?}",
+                    map.statics.len(),
+                    map.thread_locals.len(),
+                    map_start.elapsed()
+                );
+
+                // Statics local to their object file are only in the map.
+                for (name, rva) in &map.statics {
+                    let _ = symbol_table
+                        .entry(name.clone())
+                        .or_insert_with(|| CachedSymbol {
+                            address: *rva,
+                            kind: SymbolKind::Data,
+                            is_undefined: false,
+                            is_weak: false,
+                            size: 0,
+                            flags: SymbolFlags::None,
+                        });
+                }
+
                 Cache {
                     symbol_table,
                     path: original.to_path_buf(),
+                    statics: map.statics,
+                    thread_locals: map.thread_locals,
+                    tls_size: map.tls_size,
                     ..Default::default()
                 }
             }
@@ -738,9 +776,16 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
 /// Note - this function is not defined to run on WASM binaries. The `object` crate does not
 ///
 /// todo... we need to wire up the cache
+///
+/// The members of `replaced_members` are skipped, since loose copies of them are linked instead.
+/// With `share_thread_locals`, the patch reads thread locals through the executable's TLS slot,
+/// and its thread locals sit at the offsets they have in the executable's TLS block (see
+/// [`crate::statics`]).
 pub fn create_undefined_symbol_stub(
     cache: &Cache,
     incrementals: &[PathBuf],
+    replaced_members: &HashMap<PathBuf, HashSet<Vec<u8>>>,
+    share_thread_locals: bool,
     triple: &Triple,
     aslr_reference: u64,
 ) -> Result<Vec<u8>> {
@@ -770,11 +815,14 @@ pub fn create_undefined_symbol_stub(
             // Rlibs are archives of object files, plus the crate's metadata.
             if bytes.starts_with(b"!<arch>\n") {
                 let archive = object::read::archive::ArchiveFile::parse(bytes.deref())?;
+                let replaced = replaced_members.get(path);
 
                 for member in archive.members() {
                     let member = member?;
 
-                    if member.name().ends_with(b".o") {
+                    if member.name().ends_with(b".o")
+                        && !replaced.is_some_and(|replaced| replaced.contains(member.name()))
+                    {
                         collect(member.data(bytes.deref())?)?;
                     }
                 }
@@ -796,7 +844,7 @@ pub fn create_undefined_symbol_stub(
 
     let undefined_symbols: Vec<_> = undefined_symbols
         .difference(&defined_symbols)
-        .filter(|name| !is_module_local(name, triple))
+        .filter(|name| share_thread_locals || !is_module_local(name, triple))
         .cloned()
         .collect();
 
@@ -871,7 +919,34 @@ pub fn create_undefined_symbol_stub(
     // we need to assemble a PLT/GOT so direct calls to the patch symbols work
     // for each symbol we either write the address directly (as a symbol) or create a PLT/GOT entry
     let text_section = obj.section_id(StandardSection::Text);
+
+    // The thread locals at their offsets in the executable's TLS block. The section is named
+    // `.tls`, like the start of the block, so the linker puts it first.
+    let tls_section = (share_thread_locals && triple.operating_system == OperatingSystem::Windows)
+        .then(|| {
+            let section = obj.add_section(Vec::new(), b".tls".to_vec(), object::SectionKind::Data);
+            let _ = obj.append_section_data(section, &vec![0; cache.tls_size as usize], 16);
+            section
+        });
+
     for name in undefined_symbols {
+        if let Some(tls_section) = tls_section
+            && let Some(offset) = cache.thread_locals.get(&name)
+        {
+            let _ = obj.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: *offset,
+                size: 0,
+                scope: SymbolScope::Linkage,
+                kind: SymbolKind::Data,
+                weak: false,
+                section: SymbolSection::Section(tls_section),
+                flags: SymbolFlags::None,
+            });
+
+            continue;
+        }
+
         let Some(sym) = cache
             .symbol_table
             .get(name.as_str().trim_start_matches("__imp_"))
@@ -1520,4 +1595,127 @@ pub fn pe_image_size(path: &Path) -> Result<u64> {
         .and_then(|pe| u32_at(pe as usize + 4 + 20 + 56))
         .map(u64::from)
         .ok_or_else(|| PatchError::InvalidModule(format!("{} is not a PE image", path.display())))
+}
+
+/// The data symbols in the map file of an MSVC-style linker (`/MAP`).
+///
+/// A map lists the sections of the image, then every symbol with its section, its offset in
+/// it and its address, including the symbols local to their object file:
+///
+/// ```text
+///  Preferred load address is 0000000140000000
+///
+///  Start         Length     Name                   Class
+///  0003:00000000 00000040H .data                   DATA
+///  ...
+///   Address         Publics by Value              Rva+Base               Lib:Object
+///  0003:00000000       _RNvCs9iLEuQrSxnw_1t6SHARED 0000000140021000     t.cgu.0.rcgu.o
+///  ...
+///  Static symbols
+///  ...
+/// ```
+#[derive(Debug, Default)]
+struct LinkMap {
+    statics: HashMap<String, u64>,
+    thread_locals: HashMap<String, u64>,
+    tls_size: u64,
+}
+
+impl LinkMap {
+    fn read(path: &Path) -> Result<Self> {
+        enum Contents {
+            Data,
+            ThreadLocals,
+            Other,
+        }
+
+        let map = std::fs::read_to_string(path)?;
+        let invalid =
+            |what: &str| PatchError::InvalidModule(format!("{what} in {}", path.display()));
+
+        let mut base = None;
+        // The parts of each section: (start, end, contents)
+        let mut sections: HashMap<u16, Vec<(u64, u64, Contents)>> = HashMap::new();
+        let mut link_map = LinkMap::default();
+
+        let parse_address = |address: &str| -> Option<(u16, u64)> {
+            let (section, offset) = address.split_once(':')?;
+            Some((
+                u16::from_str_radix(section, 16).ok()?,
+                u64::from_str_radix(offset, 16).ok()?,
+            ))
+        };
+
+        for line in map.lines() {
+            if let Some(address) = line.trim().strip_prefix("Preferred load address is ") {
+                base = u64::from_str_radix(address, 16).ok();
+                continue;
+            }
+
+            let mut fields = line.split_whitespace();
+
+            let (Some(address), Some(second), Some(third)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+
+            let Some((section, offset)) = parse_address(address) else {
+                continue;
+            };
+
+            // A part of a section: its length, then its name.
+            if let Some(length) = second.strip_suffix('H') {
+                let Ok(length) = u64::from_str_radix(length, 16) else {
+                    continue;
+                };
+
+                let contents = if third.starts_with(".data") || third.starts_with(".bss") {
+                    Contents::Data
+                } else if third.starts_with(".tls") {
+                    link_map.tls_size = link_map.tls_size.max(offset + length);
+                    Contents::ThreadLocals
+                } else {
+                    Contents::Other
+                };
+
+                sections
+                    .entry(section)
+                    .or_default()
+                    .push((offset, offset + length, contents));
+
+                continue;
+            }
+
+            // A symbol: its name, then its address.
+            let (name, Ok(address)) = (second, u64::from_str_radix(third, 16)) else {
+                continue;
+            };
+
+            let Some((_, _, contents)) = sections.get(&section).and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|(start, end, _)| (*start..*end).contains(&offset))
+            }) else {
+                continue;
+            };
+
+            match contents {
+                Contents::Data => {
+                    let base = base.ok_or_else(|| invalid("No load address"))?;
+                    let _ = link_map.statics.insert(name.to_owned(), address - base);
+                }
+                Contents::ThreadLocals => {
+                    let _ = link_map.thread_locals.insert(name.to_owned(), offset);
+                }
+                Contents::Other => {}
+            }
+        }
+
+        if sections.is_empty() {
+            return Err(invalid("No sections"));
+        }
+
+        Ok(link_map)
+    }
 }
