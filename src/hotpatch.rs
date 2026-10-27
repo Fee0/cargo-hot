@@ -859,6 +859,10 @@ pub fn create_undefined_symbol_stub(
         defined_symbols.extend(defined);
     }
 
+    // Patches export `main`, which the app finds them by. A patch without the target's code
+    // exports the original one.
+    let _ = undefined_symbols.insert(main_sentinel(triple).to_owned());
+
     let undefined_symbols: Vec<_> = undefined_symbols
         .difference(&defined_symbols)
         .filter(|name| share_thread_locals || !is_module_local(name, triple))

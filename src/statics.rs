@@ -36,11 +36,12 @@ pub struct Sharing {
 /// Turn the statics of `objects` and of the members of `rlibs` that the app has into references.
 ///
 /// `objects` are rewritten in place, rlib members are copied to `out_dir` when they define a
-/// shared static.
+/// shared static, or always with `whole_rlibs`, which links all of their members.
 pub fn share(
     cache: &Cache,
     objects: &[PathBuf],
     rlibs: &[PathBuf],
+    whole_rlibs: bool,
     out_dir: &Path,
 ) -> anyhow::Result<Sharing> {
     let _ = std::fs::remove_dir_all(out_dir);
@@ -122,7 +123,7 @@ pub fn share(
             .map(|symbol| (symbol.offset, symbol.section))
             .collect();
 
-        if shared.is_empty() {
+        if shared.is_empty() && !(whole_rlibs && member.is_some()) {
             continue;
         }
 

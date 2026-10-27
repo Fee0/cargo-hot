@@ -200,6 +200,8 @@ struct PatchState {
     next_patch_base: Option<u64>,
     /// The patches loaded by the app, whose functions are redirected to newer patches too.
     patches: Vec<LoadedPatch>,
+    /// The jump table of the last patch, with absolute addresses, on Windows.
+    jump_table: subsecond_types::AddressMap,
 }
 
 /// A patch loaded by the app.
@@ -239,6 +241,9 @@ pub enum BuildMode {
         rustc_args: rustc::Args,
         /// Recompiled workspace libraries to link into the patch.
         workspace_rlibs: Vec<PathBuf>,
+        /// Whether to compile the target into the patch. Without it, the patch holds all of
+        /// the libraries' code, which is redirected to.
+        compile_target: bool,
         /// The address the patch must be loaded at, if any.
         patch_base: Option<u64>,
         changed_files: Vec<PathBuf>,
@@ -592,6 +597,7 @@ impl Server {
                 needs_restart = true;
             }
 
+            let only_bodies_changed = sources.only_bodies_changed(&changed_files);
             let changed_sources = layout::Sources::read_files(&changed_files);
 
             let start = Instant::now();
@@ -662,6 +668,7 @@ impl Server {
                     &build,
                     changed_files,
                     changed_crates.unwrap_or_default(),
+                    only_bodies_changed,
                     &mut patch_state,
                     active_connection.aslr_reference() as u64,
                 )
@@ -711,6 +718,18 @@ impl Server {
                 .iter()
                 .map(|krate| krate.src_dir.as_path()),
         )
+    }
+
+    /// Whether `file` is a source of the target, rather than of a library.
+    fn is_target_file(&self, file: &Path) -> bool {
+        let depth = |dir: &Path| dir.components().count();
+
+        file.starts_with(&self.crate_src_dir)
+            && self
+                .workspace_crates
+                .iter()
+                .filter(|krate| file.starts_with(&krate.src_dir))
+                .all(|krate| depth(&krate.src_dir) <= depth(&self.crate_src_dir))
     }
 
     /// The workspace libraries the changed files belong to, or `None` if a change can only be
@@ -856,29 +875,27 @@ impl Server {
     async fn build(&self, mode: BuildMode) -> Result<Build> {
         // Run the cargo build to produce our artifacts
         let compile_start = Instant::now();
-        let mut build = self.cargo_build(&mode).await?;
+        let mut build = match &mode {
+            BuildMode::Thin {
+                compile_target: false,
+                rustc_args,
+                ..
+            } => Build {
+                exe: PathBuf::new(),
+                is_fresh: false,
+                direct_rustc: rustc_args.clone(),
+                time_start: SystemTime::now(),
+                patch_cache: None,
+            },
+            mode => self.cargo_build(mode).await?,
+        };
         log::debug!("Compiled in {:.2?}", compile_start.elapsed());
 
         // Write the build artifacts to the bundle on the disk
         match &mode {
-            BuildMode::Thin {
-                aslr_reference,
-                cache,
-                rustc_args,
-                workspace_rlibs,
-                patch_base,
-                ..
-            } => {
+            BuildMode::Thin { .. } => {
                 let link_start = Instant::now();
-                self.write_patch(
-                    *aslr_reference,
-                    &mut build,
-                    cache,
-                    rustc_args,
-                    workspace_rlibs,
-                    *patch_base,
-                )
-                .await?;
+                self.write_patch(&mode, &mut build).await?;
                 log::debug!("Linked patch in {:.2?}", link_start.elapsed());
             }
 
@@ -906,16 +923,40 @@ impl Server {
         build: &Build,
         changed_files: BTreeSet<PathBuf>,
         changed_crates: BTreeSet<String>,
+        only_bodies_changed: bool,
         state: &mut PatchState,
         aslr_reference: u64,
     ) -> Result<Patch> {
-        self.compile_workspace_crates(changed_crates, state).await?;
+        // Changed function bodies of libraries only need their own crate compiled, since the
+        // old functions are redirected to the new ones. The first patch has the target's code,
+        // for the jump table to point the app's entry points into a patch: iced takes entry
+        // points that stay in the executable as a sign that types changed.
+        let compile_target = !(only_bodies_changed
+            && self.redirect
+            && !state.jump_table.is_empty()
+            && !changed_crates.is_empty()
+            && !changed_files.iter().any(|file| self.is_target_file(file)));
 
-        let workspace_rlibs = state
-            .modified
-            .iter()
-            .map(|crate_name| self.rlib(crate_name))
-            .collect::<Result<_>>()?;
+        let workspace_rlibs = if compile_target {
+            self.compile_workspace_crates(changed_crates, true, state)
+                .await?;
+
+            state
+                .modified
+                .iter()
+                .map(|crate_name| self.rlib(crate_name))
+                .collect::<Result<_>>()?
+        } else {
+            log::debug!("Only function bodies changed, compiling {changed_crates:?} alone");
+
+            self.compile_workspace_crates(changed_crates.clone(), false, state)
+                .await?;
+
+            changed_crates
+                .iter()
+                .map(|crate_name| self.rlib(crate_name))
+                .collect::<Result<_>>()?
+        };
 
         let cache = build.patch_cache.clone().unwrap();
         let patch_base = self.patch_base(&cache, state, aslr_reference)?;
@@ -924,6 +965,7 @@ impl Server {
             .build(BuildMode::Thin {
                 rustc_args: build.direct_rustc.clone(),
                 workspace_rlibs,
+                compile_target,
                 patch_base,
                 changed_files: changed_files.into_iter().collect(),
                 aslr_reference,
@@ -938,11 +980,31 @@ impl Server {
         }
 
         let jump_table_start = Instant::now();
-        let jump_table = hotpatch::create_jump_table(
+        let mut jump_table = hotpatch::create_jump_table(
             &self.patch_exe(patch.time_start),
             &self.triple,
             build.patch_cache.as_ref().unwrap(),
         )?;
+
+        // subsecond takes the table's addresses as relative to the patch's `main`, unless the
+        // base of `main` is given as absolute too. Absolute addresses can point into earlier
+        // patches, so the entries of functions that this patch lacks keep pointing to their
+        // newest version, instead of falling back to the executable. Patches without the
+        // target's code lack all of its entry points.
+        if let Some(base) = patch_base {
+            jump_table.new_base_address += base;
+
+            for address in jump_table.map.values_mut() {
+                *address += base;
+            }
+
+            for (old, new) in &state.jump_table {
+                let _ = jump_table.map.entry(*old).or_insert(*new);
+            }
+
+            state.jump_table = jump_table.map.clone();
+        }
+
         log::debug!(
             "Created jump table ({} entries) in {:.2?}",
             jump_table.map.len(),
@@ -1166,23 +1228,55 @@ impl Server {
     /// patch, so the generic and inlined code they took from a changed library is updated too.
     ///
     /// Crates whose dependencies are all compiled are compiled in parallel.
+    ///
+    /// Without `with_dependents`, only the changed crates are compiled, and their dependents
+    /// before the target is compiled next.
     async fn compile_workspace_crates(
         &self,
         changed_crates: BTreeSet<String>,
+        with_dependents: bool,
         state: &mut PatchState,
     ) -> Result<()> {
         // `workspace_crates` lists dependencies first, so one pass finds every dependent.
-        let mut stale = changed_crates;
-        stale.append(&mut state.pending);
-
-        for krate in &self.workspace_crates {
-            if krate
-                .dependencies
-                .iter()
-                .any(|dependency| stale.contains(dependency))
-            {
-                let _ = stale.insert(krate.crate_name.clone());
+        let dependents = |crates: &mut BTreeSet<String>| {
+            for krate in &self.workspace_crates {
+                if krate
+                    .dependencies
+                    .iter()
+                    .any(|dependency| crates.contains(dependency))
+                {
+                    let _ = crates.insert(krate.crate_name.clone());
+                }
             }
+        };
+
+        let mut stale = changed_crates;
+
+        if with_dependents {
+            stale.append(&mut state.pending);
+            dependents(&mut stale);
+        } else {
+            // Libraries the changed ones depend on, which are outdated themselves, must be
+            // compiled first. `workspace_crates` lists dependencies first, so going backwards
+            // finds them in one pass.
+            for krate in self.workspace_crates.iter().rev() {
+                if stale.contains(&krate.crate_name) {
+                    stale.extend(
+                        krate
+                            .dependencies
+                            .iter()
+                            .filter(|dependency| state.pending.contains(*dependency))
+                            .cloned(),
+                    );
+                }
+            }
+
+            let mut pending = stale.clone();
+            dependents(&mut pending);
+
+            state
+                .pending
+                .extend(pending.into_iter().filter(|krate| !stale.contains(krate)));
         }
 
         if stale.is_empty() {
@@ -1232,13 +1326,14 @@ impl Server {
             }
 
             let _ = stale.remove(&crate_name);
+            let _ = state.pending.remove(&crate_name);
             let _ = state.modified.insert(crate_name);
         };
 
         // A dependent compiled after a failure would build against outdated libraries, so
         // whatever has not finished is compiled again next time.
         compiling.shutdown().await;
-        state.pending = stale;
+        state.pending.extend(stale);
 
         result?;
 
@@ -1525,15 +1620,23 @@ impl Server {
         })
     }
 
-    async fn write_patch(
-        &self,
-        aslr_reference: u64,
-        build: &mut Build,
-        cache: &Arc<hotpatch::Cache>,
-        rustc_args: &rustc::Args,
-        workspace_rlibs: &[PathBuf],
-        patch_base: Option<u64>,
-    ) -> anyhow::Result<()> {
+    async fn write_patch(&self, mode: &BuildMode, build: &mut Build) -> anyhow::Result<()> {
+        let BuildMode::Thin {
+            aslr_reference,
+            cache,
+            rustc_args,
+            workspace_rlibs,
+            compile_target,
+            patch_base,
+            ..
+        } = mode
+        else {
+            return Err(anyhow!("Only thin builds are patches"));
+        };
+
+        let (aslr_reference, compile_target, patch_base) =
+            (*aslr_reference, *compile_target, *patch_base);
+
         log::debug!(
             "Original builds for patch: {}",
             self.link_args_file().display()
@@ -1599,10 +1702,13 @@ impl Server {
         let mut dylibs = vec![];
         let temp_objects = args
             .iter()
-            .filter(|arg| arg.ends_with(".rcgu.o"))
+            .filter(|arg| compile_target && arg.ends_with(".rcgu.o"))
             .sorted()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
+
+        // Without the target, nothing pulls the libraries' code out of their rlibs.
+        let whole_rlibs = !compile_target;
 
         let sharing = if self.triple.operating_system == OperatingSystem::Windows {
             let start = Instant::now();
@@ -1610,6 +1716,7 @@ impl Server {
                 cache,
                 &temp_objects,
                 workspace_rlibs,
+                whole_rlibs,
                 &self.shared_objects_dir(),
             )?;
 
@@ -1692,7 +1799,9 @@ impl Server {
         // member as soon as it defines a symbol that is undefined so far, and the stub defines
         // the statics shared with the app, which members define too. Their rlibs are kept,
         // unlike the target's objects.
-        out_args.extend(workspace_rlibs.iter().map(Into::into));
+        if !whole_rlibs {
+            out_args.extend(workspace_rlibs.iter().map(Into::into));
+        }
         out_args.extend(dylibs.iter().map(Into::into));
         out_args.extend(self.thin_link_args(&args)?.iter().map(Into::into));
 
@@ -1728,13 +1837,11 @@ impl Server {
             .await?;
         log::debug!("Ran the linker in {:.2?}", linker_start.elapsed());
 
-        if !res.stderr.is_empty() {
-            let errs = String::from_utf8_lossy(&res.stderr);
-            if !self.patch_exe(build.time_start).exists() || !res.status.success() {
-                log::error!("Failed to generate patch: {}", errs.trim());
-            } else {
-                log::trace!("Linker output during thin linking: {}", errs.trim());
-            }
+        let errs = String::from_utf8_lossy(&res.stderr);
+        let is_linked = res.status.success() && self.patch_exe(build.time_start).exists();
+
+        if is_linked && !errs.is_empty() {
+            log::trace!("Linker output during thin linking: {}", errs.trim());
         }
 
         // For some really weird reason that I think is because of dlopen caching, future loads of the
@@ -1760,6 +1867,10 @@ impl Server {
         }
 
         _ = std::fs::remove_file(self.main_exe().with_file_name("stub.o"));
+
+        if !is_linked {
+            return Err(anyhow!("Failed to link the patch: {}", errs.trim()));
+        }
 
         Ok(())
     }

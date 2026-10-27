@@ -8,6 +8,10 @@
 //! The check compares definitions token by token, so it also asks for a restart when only a
 //! derive or a field's visibility changed. It cannot see layouts that change indirectly, like a
 //! `const` used as an array length.
+//!
+//! Changes in the bodies of plain functions are also told apart from others: those functions
+//! are compiled in their own crate only, so a patch redirecting the old functions to the new ones
+//! needs nothing else recompiled.
 use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::Visit;
@@ -78,6 +82,48 @@ impl Sources {
         }
 
         None
+    }
+
+    /// Whether all changes in `changed_files` since they were remembered are in the bodies of
+    /// functions that are compiled in their own crate only: not generic, not `#[inline]`, not
+    /// `const` and not `async` (whose body is a type). Other crates call such functions, but
+    /// have none of their code.
+    pub fn only_bodies_changed<'a>(
+        &self,
+        changed_files: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> bool {
+        changed_files.into_iter().all(|file| {
+            let (Some(old), Ok(new)) = (self.files.get(file), std::fs::read_to_string(file)) else {
+                return false;
+            };
+
+            if *old == new {
+                return true;
+            }
+
+            let (Some(old), Some(new)) = (items(old), items(&new)) else {
+                return false;
+            };
+
+            new.iter().all(|(key, new)| match (old.get(key), new) {
+                (Some(Item::Other(old)), Item::Other(new)) => old == new,
+                (
+                    Some(Item::Function {
+                        signature: old_signature,
+                        body: old_body,
+                        ..
+                    }),
+                    Item::Function {
+                        signature,
+                        body,
+                        is_local,
+                    },
+                ) => old_signature == signature && (old_body == body || *is_local),
+                // A new function is new code.
+                (None, Item::Function { is_local, .. }) => *is_local,
+                _ => false,
+            }) && old.keys().all(|key| new.contains_key(key))
+        })
     }
 
     /// The current contents of `files`, to [`Sources::remember`] once the app runs them.
@@ -244,6 +290,152 @@ fn without_docs(tokens: TokenStream) -> TokenStream {
     output.into_iter().collect()
 }
 
+/// An item of a source file, as tokens without doc comments.
+#[derive(Debug, PartialEq)]
+enum Item {
+    Function {
+        signature: String,
+        body: String,
+        /// Whether the function is compiled in its crate only (see [`Sources::only_bodies_changed`]).
+        is_local: bool,
+    },
+    Other(String),
+}
+
+/// The items of `source`, by their path in the file.
+fn items(source: &str) -> Option<HashMap<String, Item>> {
+    let file = syn::parse_file(source).ok()?;
+    let mut items = HashMap::new();
+
+    collect_items(&file.items, "", &mut items);
+
+    Some(items)
+}
+
+fn collect_items(source: &[syn::Item], prefix: &str, items: &mut HashMap<String, Item>) {
+    let add = |key: String, item: Item, items: &mut HashMap<String, Item>| {
+        let mut unique = key.clone();
+        let mut index = 1;
+
+        while items.contains_key(&unique) {
+            index += 1;
+            unique = format!("{key} #{index}");
+        }
+
+        let _ = items.insert(unique, item);
+    };
+
+    for item in source {
+        match item {
+            syn::Item::Fn(function) => add(
+                format!("{prefix}{}", function.sig.ident),
+                self::function(
+                    &function.attrs,
+                    &function.vis,
+                    &function.sig,
+                    &function.block,
+                    false,
+                ),
+                items,
+            ),
+            syn::Item::Mod(module) if module.content.is_some() => {
+                let mut header = module.clone();
+                header.content = None;
+                add(
+                    format!("{prefix}mod {}", module.ident),
+                    other(&header),
+                    items,
+                );
+
+                collect_items(
+                    &module.content.as_ref().unwrap().1,
+                    &format!("{prefix}{}::", module.ident),
+                    items,
+                );
+            }
+            syn::Item::Impl(implementation) => {
+                let is_generic = has_type_parameters(&implementation.generics);
+                let name = format!(
+                    "{prefix}impl {}{}",
+                    implementation
+                        .trait_
+                        .as_ref()
+                        .map(|(_, path, _)| format!("{} for ", path.to_token_stream()))
+                        .unwrap_or_default(),
+                    implementation.self_ty.to_token_stream()
+                );
+
+                let mut header = implementation.clone();
+                header.items.clear();
+                add(name.clone(), other(&header), items);
+
+                for impl_item in &implementation.items {
+                    match impl_item {
+                        syn::ImplItem::Fn(method) => add(
+                            format!("{name}::{}", method.sig.ident),
+                            function(
+                                &method.attrs,
+                                &method.vis,
+                                &method.sig,
+                                &method.block,
+                                is_generic,
+                            ),
+                            items,
+                        ),
+                        impl_item => add(format!("{name}::item"), other(impl_item), items),
+                    }
+                }
+            }
+            item => add(format!("{prefix}item"), other(item), items),
+        }
+    }
+}
+
+fn function(
+    attrs: &[syn::Attribute],
+    visibility: &syn::Visibility,
+    signature: &syn::Signature,
+    body: &syn::Block,
+    in_generic_impl: bool,
+) -> Item {
+    let is_inline = attrs.iter().any(|attr| attr.path().is_ident("inline"));
+    let takes_impl_trait = signature
+        .inputs
+        .to_token_stream()
+        .into_iter()
+        .any(|token| matches!(token, TokenTree::Ident(ident) if ident == "impl"));
+
+    let mut tokens = TokenStream::new();
+    for attr in attrs {
+        attr.to_tokens(&mut tokens);
+    }
+    visibility.to_tokens(&mut tokens);
+    signature.to_tokens(&mut tokens);
+
+    Item::Function {
+        signature: without_docs(tokens).to_string(),
+        body: body.to_token_stream().to_string(),
+        is_local: !in_generic_impl
+            && !has_type_parameters(&signature.generics)
+            && !takes_impl_trait
+            && !is_inline
+            && signature.constness.is_none()
+            && signature.asyncness.is_none(),
+    }
+}
+
+fn other(item: &impl ToTokens) -> Item {
+    Item::Other(without_docs(item.to_token_stream()).to_string())
+}
+
+/// Whether `generics` has type or const parameters, which make code generic, unlike lifetimes.
+fn has_type_parameters(generics: &syn::Generics) -> bool {
+    generics
+        .params
+        .iter()
+        .any(|param| !matches!(param, syn::GenericParam::Lifetime(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +463,67 @@ mod tests {
             "trait T { fn f(&self) -> u32 { 2 } }",
         ));
         assert!(!changed("struct A;", "struct A; struct B { y: f32 }"));
+    }
+
+    fn only_bodies(old: &str, new: &str) -> bool {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("lib.rs");
+
+        std::fs::write(&file, old).unwrap();
+        let sources = Sources::read([directory.path()]);
+        std::fs::write(&file, new).unwrap();
+
+        sources.only_bodies_changed([&file])
+    }
+
+    #[test]
+    fn plain_function_bodies_are_local() {
+        assert!(only_bodies("fn f() -> u32 { 1 }", "fn f() -> u32 { 2 }"));
+        assert!(only_bodies(
+            "struct A; impl A { pub fn f(&self) -> u32 { 1 } }",
+            "struct A; impl A { pub fn f(&self) -> u32 { 2 } }",
+        ));
+        assert!(only_bodies(
+            "mod m { fn f<'a>(x: &'a str) -> &'a str { x } }",
+            "mod m { fn f<'a>(x: &'a str) -> &'a str { &x[1..] } }",
+        ));
+        assert!(only_bodies("fn f() {}", "fn f() {} fn g() {}"));
+        assert!(only_bodies("/// Old.\nfn f() {}", "/// New.\nfn f() {}"));
+    }
+
+    #[test]
+    fn other_changes_are_not() {
+        assert!(!only_bodies(
+            "fn f<T>() -> u32 { 1 }",
+            "fn f<T>() -> u32 { 2 }"
+        ));
+        assert!(!only_bodies(
+            "fn f(x: impl Into<u32>) -> u32 { 1 }",
+            "fn f(x: impl Into<u32>) -> u32 { 2 }",
+        ));
+        assert!(!only_bodies(
+            "struct A<T>(T); impl<T> A<T> { fn f(&self) -> u32 { 1 } }",
+            "struct A<T>(T); impl<T> A<T> { fn f(&self) -> u32 { 2 } }",
+        ));
+        assert!(!only_bodies(
+            "#[inline] fn f() -> u32 { 1 }",
+            "#[inline] fn f() -> u32 { 2 }"
+        ));
+        assert!(!only_bodies(
+            "const fn f() -> u32 { 1 }",
+            "const fn f() -> u32 { 2 }"
+        ));
+        assert!(!only_bodies(
+            "async fn f() -> u32 { 1 }",
+            "async fn f() -> u32 { 2 }"
+        ));
+        assert!(!only_bodies("fn f(x: u8) {}", "fn f(x: u16) {}"));
+        assert!(!only_bodies("const X: u32 = 1;", "const X: u32 = 2;"));
+        assert!(!only_bodies("fn f() {} fn g() {}", "fn f() {}"));
+        assert!(!only_bodies(
+            "trait T { fn f(&self) -> u32 { 1 } }",
+            "trait T { fn f(&self) -> u32 { 2 } }",
+        ));
     }
 
     #[test]
