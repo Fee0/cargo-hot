@@ -423,6 +423,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rayon",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "subsecond",
@@ -437,6 +438,7 @@ dependencies = [
  "walrus",
  "wasmparser 0.232.0",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3215,6 +3217,12 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc-hash"

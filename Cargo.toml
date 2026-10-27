@@ -27,6 +27,7 @@ pdb.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
 rayon.workspace = true
+rustc-demangle.workspace = true
 serde_json.workspace = true
 subsecond.workspace = true
 subsecond-types.workspace = true
@@ -54,6 +55,19 @@ tokio.features = ["rt-multi-thread", "io-util", "macros", "net", "process", "syn
 
 uuid.workspace = true
 uuid.features = ["v5"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+windows-sys.features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+]
 
 walrus.workspace = true
 walrus.features = ["parallel"]
@@ -88,6 +102,7 @@ pdb = "0.8"
 proc-macro2 = "1"
 quote = "1"
 rayon = "1.10"
+rustc-demangle = "0.1"
 serde = "1"
 serde_json = "1"
 subsecond = "0.7"
@@ -102,6 +117,7 @@ uuid = "1.17"
 walrus = "0.23"
 wasmparser = "0.232"
 which = "7"
+windows-sys = "0.61"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }

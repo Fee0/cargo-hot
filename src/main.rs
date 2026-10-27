@@ -110,6 +110,11 @@ fn command() -> Command {
             "Rebuild and restart the app when it crashes, instead of exiting",
         ))
         .arg(flag(
+            "no-redirect",
+            "Only run patched code where the app calls through its hot reloading entry points \
+            (like iced's `update` and `view`), instead of redirecting all old code to it",
+        ))
+        .arg(flag(
             "full-debuginfo",
             "Keep the profile's debug info for the hot reloaded crate \
             (by default it is reduced to line tables, for faster patches)",
@@ -128,6 +133,9 @@ fn command() -> Command {
             "Run `<cyan,bold>cargo help run</>` for more detailed information.\n"
         ))
 }
+
+/// The size of the jump that redirects a function.
+const JUMP_SIZE: u64 = 5;
 
 /// Windows maps images at multiples of 64 KiB.
 const PATCH_ALIGNMENT: u64 = 64 << 10;
@@ -161,6 +169,7 @@ pub struct Server {
     extra_rustc_args: Vec<String>,
     verbose: u8,
     auto_restart: bool,
+    redirect: bool,
     full_debuginfo: bool,
     no_default_features: bool,
     target_dir: Filesystem,
@@ -189,6 +198,29 @@ struct PatchState {
     pending: BTreeSet<String>,
     /// Where the next patch is loaded, on Windows (see [`Server::patch_base`]).
     next_patch_base: Option<u64>,
+    /// The patches loaded by the app, whose functions are redirected to newer patches too.
+    patches: Vec<LoadedPatch>,
+}
+
+/// A patch loaded by the app.
+#[derive(Debug)]
+struct LoadedPatch {
+    base: u64,
+    functions: HashMap<String, hotpatch::Function>,
+}
+
+/// A patch, ready to be sent to the app.
+struct Patch {
+    jump_table: JumpTable,
+    /// The jumps from old functions to the patched ones, once the app has loaded the patch.
+    detours: Vec<Detour>,
+}
+
+/// A jump from the entry of an old function to its new version (see `cargo_hot::detour`).
+#[derive(Debug, Clone, Copy)]
+struct Detour {
+    from: u64,
+    to: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -371,6 +403,11 @@ impl Server {
         let workspace_crates = workspace_crates(&workspace, main_package);
         let workspace_dir = workspace.root_manifest().parent().unwrap().to_path_buf();
 
+        // Redirecting writes x64 jumps into the app.
+        let redirect = !args.flag("no-redirect")
+            && triple.operating_system == OperatingSystem::Windows
+            && triple.architecture == Architecture::X86_64;
+
         Ok(Self {
             gctx,
             sysroot: PathBuf::from(sysroot),
@@ -391,6 +428,7 @@ impl Server {
             extra_rustc_args,
             verbose: args.get_count("verbose"),
             auto_restart: args.flag("auto-restart"),
+            redirect,
             full_debuginfo: args.flag("full-debuginfo"),
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
@@ -619,7 +657,7 @@ impl Server {
                 ),
             );
 
-            let jump_table = match self
+            let patch = match self
                 .patch(
                     &build,
                     changed_files,
@@ -629,14 +667,31 @@ impl Server {
                 )
                 .await
             {
-                Ok(jump_table) => jump_table,
+                Ok(patch) => patch,
                 Err(error) => {
                     log::error!("Patch failed: {error:#}");
                     continue;
                 }
             };
 
-            match active_connection.patch(&jump_table).await {
+            if let Some(base) = patch_state.patches.last().map(|patch| patch.base)
+                && !patch.detours.is_empty()
+                && let Err(error) = self
+                    .redirect(
+                        &executable,
+                        patch.jump_table.lib.clone(),
+                        base,
+                        patch.detours,
+                    )
+                    .await
+            {
+                // A patch loaded elsewhere reads garbage instead of the app's data.
+                log::error!("Restarting, since the patch could not be loaded: {error:#}");
+                needs_restart = true;
+                continue;
+            }
+
+            match active_connection.patch(&patch.jump_table).await {
                 Ok(()) => {
                     sources.remember(changed_sources);
                     self.status_finished(start);
@@ -853,7 +908,7 @@ impl Server {
         changed_crates: BTreeSet<String>,
         state: &mut PatchState,
         aslr_reference: u64,
-    ) -> Result<JumpTable> {
+    ) -> Result<Patch> {
         self.compile_workspace_crates(changed_crates, state).await?;
 
         let workspace_rlibs = state
@@ -894,17 +949,173 @@ impl Server {
             jump_table_start.elapsed()
         );
 
+        let detours = match patch_base {
+            Some(base) if self.redirect => self.detours(
+                &cache,
+                state,
+                &self.patch_exe(patch.time_start),
+                base,
+                aslr_reference,
+            )?,
+            _ => Vec::new(),
+        };
+
         // Older patches stay loaded, but only the newest one runs and is worth debugging.
         let current_pdb = self.patch_exe(patch.time_start).with_extension("pdb");
         self.remove_patch_files(|path| {
             match path.extension().and_then(|extension| extension.to_str()) {
-                Some("lib" | "exp") => true,
+                Some("lib" | "exp" | "map") => true,
                 Some("pdb") => path != current_pdb,
                 _ => false,
             }
         });
 
-        Ok(jump_table)
+        Ok(Patch {
+            jump_table,
+            detours,
+        })
+    }
+
+    /// The jumps that redirect the old versions of the functions in the patch at `module`, in
+    /// the executable and in earlier patches, to the patch.
+    ///
+    /// Closures and async bodies are left alone: values created by the old code, like stored
+    /// callbacks and futures in flight, hold the captures of the old body, which the new body
+    /// may lay out differently.
+    fn detours(
+        &self,
+        cache: &hotpatch::Cache,
+        state: &mut PatchState,
+        module: &Path,
+        base: u64,
+        aslr_reference: u64,
+    ) -> Result<Vec<Detour>> {
+        let start = Instant::now();
+        let functions =
+            hotpatch::patch_functions(&module.with_extension("map"), &self.crate_names())?;
+
+        let exe_base = aslr_reference
+            - cache
+                .symbol_table
+                .get("main")
+                .context("No `main` in the executable")?
+                .address;
+
+        let old_images = std::iter::once((exe_base, &cache.functions)).chain(
+            state
+                .patches
+                .iter()
+                .map(|patch| (patch.base, &patch.functions)),
+        );
+
+        let mut detours = Vec::new();
+
+        for (old_base, old_functions) in old_images {
+            for (name, function) in &functions {
+                let Some(old) = old_functions.get(name) else {
+                    continue;
+                };
+
+                // Too small to hold the jump without overwriting the next function.
+                if old.size < JUMP_SIZE {
+                    continue;
+                }
+
+                log::trace!(
+                    "Redirecting {name} from {:#x} to {:#x}",
+                    old_base + old.rva,
+                    base + function.rva
+                );
+
+                detours.push(Detour {
+                    from: old_base + old.rva,
+                    to: base + function.rva,
+                });
+            }
+        }
+
+        // Demangling is the slow part, so only the redirected functions are checked.
+        let is_body = |name: &str| {
+            rustc_demangle::try_demangle(name)
+                .map(|demangled| format!("{demangled:#}").contains("::{"))
+                .unwrap_or(true)
+        };
+
+        let targets: HashSet<u64> = detours.iter().map(|detour| detour.to).collect();
+
+        let bodies: HashSet<u64> = functions
+            .iter()
+            .filter(|(_, function)| targets.contains(&(base + function.rva)))
+            .filter(|(name, _)| is_body(name))
+            .map(|(_, function)| base + function.rva)
+            .collect();
+
+        detours.retain(|detour| !bodies.contains(&detour.to));
+
+        log::debug!(
+            "Found {} functions to redirect, of {} in the patch, in {:.2?}",
+            detours.len(),
+            functions.len(),
+            start.elapsed()
+        );
+
+        state.patches.push(LoadedPatch { base, functions });
+
+        Ok(detours)
+    }
+
+    /// Load the patch at `module` into the app and redirect the app's old code to it.
+    #[cfg(windows)]
+    async fn redirect(
+        &self,
+        executable: &process::Child,
+        module: PathBuf,
+        base: u64,
+        detours: Vec<Detour>,
+    ) -> Result<()> {
+        use cargo_hot::detour;
+
+        let pid = executable.id().context("The app is not running")?;
+
+        let start = Instant::now();
+        let count = detours.len();
+
+        tokio::task::spawn_blocking(move || {
+            let mut detours: Vec<detour::Detour> = detours
+                .into_iter()
+                .map(|Detour { from, to }| detour::Detour { from, to })
+                .collect();
+
+            detour::load(pid, &module, base)?;
+            detour::apply(pid, &mut detours)
+        })
+        .await??;
+
+        log::debug!("Redirected {count} functions in {:.2?}", start.elapsed());
+
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    async fn redirect(
+        &self,
+        _executable: &process::Child,
+        _module: PathBuf,
+        _base: u64,
+        _detours: Vec<Detour>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The names of the crates whose code patches replace.
+    fn crate_names(&self) -> Vec<String> {
+        std::iter::once(self.crate_target.crate_name())
+            .chain(
+                self.workspace_crates
+                    .iter()
+                    .map(|krate| krate.crate_name.clone()),
+            )
+            .collect()
     }
 
     /// Where to load the next patch on Windows: right after the app's executable, or after the
@@ -1114,7 +1325,7 @@ impl Server {
         // TODO: Wasm
         let exe = exe.to_path_buf();
         let start = Instant::now();
-        let cache = hotpatch::Cache::new(&exe, &self.triple)?;
+        let cache = hotpatch::Cache::new(&exe, &self.triple, &self.crate_names())?;
 
         log::debug!(
             "Read {} symbols of the app in {:.2?}",
@@ -1489,6 +1700,8 @@ impl Server {
             // A fixed base keeps Windows from moving the patch.
             out_args.push(format!("/BASE:{base:#x}").into());
             out_args.push("/DYNAMICBASE:NO".into());
+            // For the functions to redirect to the patch.
+            out_args.push(format!("/MAP:{}", out_exe.with_extension("map").display()).into());
         }
         out_args.extend(out_arg.iter().map(Into::into));
 
@@ -2015,9 +2228,12 @@ impl Server {
                 // Prevent alsr from overflowing 32 bits
                 args.push("/HIGHENTROPYVA:NO".to_string());
 
-                // Unlike the PDB, the map lists the statics that are local to their object
-                // file, which patches share with the executable.
+                // Unlike the PDB, the map lists the statics and functions that are local to
+                // their object file, which patches share with or redirect from the executable.
                 args.push(format!("/MAP:{}", exe.with_extension("map").display()));
+
+                // Redirecting a function would redirect every function folded into it.
+                args.push("/OPT:NOICF".to_string());
 
                 // Export `main` so subsecond can use it for a reference point
                 args.push("/EXPORT:main".to_string());

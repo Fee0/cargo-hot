@@ -85,6 +85,16 @@ pub struct Cache {
     pub thread_locals: HashMap<String, u64>,
     /// The size of the executable's TLS block.
     pub tls_size: u64,
+    /// The functions of the workspace crates in the executable.
+    pub functions: HashMap<String, Function>,
+}
+
+/// A function of an image, from its linker map.
+#[derive(Debug, Clone, Copy)]
+pub struct Function {
+    pub rva: u64,
+    /// The bytes up to the next symbol, which may include padding.
+    pub size: u64,
 }
 
 pub struct CachedSymbol {
@@ -111,7 +121,9 @@ impl std::fmt::Debug for Cache {
 impl Cache {
     /// This caching step is crucial for performance on large projects. The original module can be
     /// quite large (hundreds of MB), so this step drastically speeds it up.
-    pub fn new(original: &Path, triple: &Triple) -> Result<Self> {
+    ///
+    /// The functions of `crates` are remembered, to redirect them to patched code.
+    pub fn new(original: &Path, triple: &Triple, crates: &[String]) -> Result<Self> {
         let cache = match triple.operating_system {
             OperatingSystem::Windows => {
                 use pdb::FallibleIterator;
@@ -177,7 +189,11 @@ impl Cache {
                 }
 
                 let map_start = std::time::Instant::now();
-                let map = LinkMap::read(&original.with_extension("map")).unwrap_or_else(|error| {
+                let keep_function = mentions_crate(crates);
+                let map = LinkMap::read(&original.with_extension("map"), &|name, _| {
+                    keep_function(name)
+                })
+                .unwrap_or_else(|error| {
                     log::warn!("Patches will not share statics with the app: {error}");
                     LinkMap::default()
                 });
@@ -209,6 +225,7 @@ impl Cache {
                     statics: map.statics,
                     thread_locals: map.thread_locals,
                     tls_size: map.tls_size,
+                    functions: map.functions,
                     ..Default::default()
                 }
             }
@@ -1619,11 +1636,15 @@ struct LinkMap {
     statics: HashMap<String, u64>,
     thread_locals: HashMap<String, u64>,
     tls_size: u64,
+    functions: HashMap<String, Function>,
 }
 
 impl LinkMap {
-    fn read(path: &Path) -> Result<Self> {
+    /// Read the map at `path`, with the functions that `keep_function` picks by their name and
+    /// the object file defining them.
+    fn read(path: &Path, keep_function: &dyn Fn(&str, &str) -> bool) -> Result<Self> {
         enum Contents {
+            Code,
             Data,
             ThreadLocals,
             Other,
@@ -1637,6 +1658,8 @@ impl LinkMap {
         // The parts of each section: (start, end, contents)
         let mut sections: HashMap<u16, Vec<(u64, u64, Contents)>> = HashMap::new();
         let mut link_map = LinkMap::default();
+        let mut code_symbols = Vec::new();
+        let mut functions = Vec::new();
 
         let parse_address = |address: &str| -> Option<(u16, u64)> {
             let (section, offset) = address.split_once(':')?;
@@ -1670,7 +1693,9 @@ impl LinkMap {
                     continue;
                 };
 
-                let contents = if third.starts_with(".data") || third.starts_with(".bss") {
+                let contents = if third.starts_with(".text") {
+                    Contents::Code
+                } else if third.starts_with(".data") || third.starts_with(".bss") {
                     Contents::Data
                 } else if third.starts_with(".tls") {
                     link_map.tls_size = link_map.tls_size.max(offset + length);
@@ -1701,6 +1726,16 @@ impl LinkMap {
             };
 
             match contents {
+                Contents::Code => {
+                    let base = base.ok_or_else(|| invalid("No load address"))?;
+                    code_symbols.push(address - base);
+
+                    let object = line.split_whitespace().last().unwrap_or_default();
+
+                    if keep_function(name, object) {
+                        functions.push((name.to_owned(), address - base));
+                    }
+                }
                 Contents::Data => {
                     let base = base.ok_or_else(|| invalid("No load address"))?;
                     let _ = link_map.statics.insert(name.to_owned(), address - base);
@@ -1716,6 +1751,46 @@ impl LinkMap {
             return Err(invalid("No sections"));
         }
 
+        code_symbols.sort_unstable();
+        code_symbols.dedup();
+
+        link_map.functions = functions
+            .into_iter()
+            .map(|(name, rva)| {
+                let next = code_symbols.partition_point(|start| *start <= rva);
+                let size = code_symbols.get(next).map_or(0, |next| next - rva);
+
+                (name, Function { rva, size })
+            })
+            .collect();
+
         Ok(link_map)
+    }
+}
+
+/// The functions of `crates` in a patch, from its linker map, without the stubs that jump to
+/// the original module.
+pub fn patch_functions(map: &Path, crates: &[String]) -> Result<HashMap<String, Function>> {
+    let keep_function = mentions_crate(crates);
+
+    Ok(LinkMap::read(map, &|name, object| {
+        !object.ends_with("stub.o") && keep_function(name)
+    })?
+    .functions)
+}
+
+/// Whether a mangled Rust symbol mentions one of `crates`, so it is defined by one of them or
+/// instantiated with their types. Both manglings spell identifiers as `<length><name>`.
+fn mentions_crate(crates: &[String]) -> impl Fn(&str) -> bool {
+    let identifiers: Vec<String> = crates
+        .iter()
+        .map(|krate| format!("{}{krate}", krate.len()))
+        .collect();
+
+    move |name| {
+        (name.starts_with("_R") || name.starts_with("_ZN"))
+            && identifiers
+                .iter()
+                .any(|identifier| name.contains(identifier))
     }
 }
