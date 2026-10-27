@@ -1,4 +1,5 @@
 pub mod hotpatch;
+pub mod layout;
 pub mod link;
 pub mod rustc;
 pub mod statics;

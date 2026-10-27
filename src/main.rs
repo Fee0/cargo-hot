@@ -1,5 +1,6 @@
 use cargo_hot::Result;
 use cargo_hot::hotpatch;
+use cargo_hot::layout;
 use cargo_hot::link::{self, LinkerFlavor};
 use cargo_hot::rustc;
 use cargo_hot::statics;
@@ -455,12 +456,13 @@ impl Server {
 
         let mut connections = accept_connections(server::Server::bind().await?);
 
+        // Read before building, so they are what the app is built from.
+        let mut sources = layout::Sources::read(self.source_dirs());
+
         let mut build = self.build(BuildMode::Fat).await?;
         let mut executable = self.spawn_executable()?;
 
-        let crate_dirs = self.workspace_crates.iter().map(|krate| &krate.src_dir);
-
-        for dir in std::iter::once(&self.crate_src_dir).chain(crate_dirs) {
+        for dir in self.source_dirs() {
             watcher.watch(dir, notify::RecursiveMode::Recursive)?;
         }
 
@@ -535,6 +537,25 @@ impl Server {
             let changed_crates = self.changed_crates(&changed_files);
             needs_restart = needs_restart || crashed || changed_crates.is_none();
 
+            let layout_start = Instant::now();
+            let changed_definition = (!needs_restart)
+                .then(|| sources.changed_definition(&changed_files))
+                .flatten();
+            log::debug!(
+                "Checked the changed definitions in {:.2?}",
+                layout_start.elapsed()
+            );
+
+            if let Some(definition) = changed_definition {
+                log::info!(
+                    "Restarting, since patched code would read the app's data with the \
+                    layout of the new {definition}"
+                );
+                needs_restart = true;
+            }
+
+            let changed_sources = layout::Sources::read_files(&changed_files);
+
             let start = Instant::now();
 
             if needs_restart {
@@ -547,8 +568,11 @@ impl Server {
                     ),
                 );
 
+                let new_sources = layout::Sources::read(self.source_dirs());
+
                 match self.restart(&mut executable).await {
                     Ok(Some(new_build)) => {
+                        sources = new_sources;
                         build = new_build;
                         connection = None;
                         patch_state = PatchState::default();
@@ -613,13 +637,25 @@ impl Server {
             };
 
             match active_connection.patch(&jump_table).await {
-                Ok(()) => self.status_finished(start),
+                Ok(()) => {
+                    sources.remember(changed_sources);
+                    self.status_finished(start);
+                }
                 Err(error) => {
                     log::error!("Lost connection to the app: {error:#}");
                     connection = None;
                 }
             }
         }
+    }
+
+    /// The source directories of the target and of the workspace libraries it depends on.
+    fn source_dirs(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.crate_src_dir.as_path()).chain(
+            self.workspace_crates
+                .iter()
+                .map(|krate| krate.src_dir.as_path()),
+        )
     }
 
     /// The workspace libraries the changed files belong to, or `None` if a change can only be
