@@ -19,13 +19,91 @@ use syn::visit::Visit;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-/// How functions changed since the app last loaded code, which tells how to patch them.
+/// How the changed source files differ from the ones the app runs, which tells how to apply
+/// them.
 #[derive(Debug, Default)]
 pub struct Changes {
-    /// See [`Sources::only_bodies_changed`].
+    /// The first definition that changed, if any: patched code would read the app's data with
+    /// its new layout.
+    pub definition: Option<String>,
+    /// Whether all changes are in the bodies of functions that are compiled in their own crate
+    /// only: not generic, not `#[inline]`, not `const` and not `async` (whose body is a type).
+    /// Other crates call such functions, but have none of their code.
     pub only_bodies: bool,
-    /// See [`Sources::changed_signatures`].
+    /// The names of the functions whose signature changed. Old code calls them with the old
+    /// arguments, which the new versions would read wrongly.
     pub signatures: BTreeSet<String>,
+    /// The current contents of the files, to [`Sources::remember`] once the app runs them.
+    pub sources: Vec<(PathBuf, Option<String>)>,
+}
+
+impl Changes {
+    fn compare(&mut self, file: &Path, old: Option<&String>, new: Option<&str>) {
+        // A new file defines new types, which no data has yet, but it is new code.
+        let (Some(old), Some(new)) = (old, new) else {
+            self.only_bodies = false;
+            return;
+        };
+
+        if old == new {
+            return;
+        }
+
+        // A file that does not parse does not compile either, which the patch reports.
+        let (Ok(old), Ok(new)) = (syn::parse_file(old), syn::parse_file(new)) else {
+            self.only_bodies = false;
+            return;
+        };
+
+        if self.definition.is_none() {
+            let (old, new) = (definitions(&old), definitions(&new));
+
+            self.definition = old
+                .iter()
+                .find(|(name, tokens)| new.get(*name).is_some_and(|new| new != *tokens))
+                .map(|(name, _)| format!("{name} in {}", file.display()));
+        }
+
+        let (old, new) = (items(&old), items(&new));
+
+        self.only_bodies &= new.iter().all(|(key, new)| match (old.get(key), new) {
+            (Some(Item::Other(old)), Item::Other(new)) => old == new,
+            (
+                Some(Item::Function {
+                    signature: old_signature,
+                    body: old_body,
+                    ..
+                }),
+                Item::Function {
+                    signature,
+                    body,
+                    is_local,
+                },
+            ) => old_signature == signature && (old_body == body || *is_local),
+            // A new function is new code.
+            (None, Item::Function { is_local, .. }) => *is_local,
+            _ => false,
+        }) && old.keys().all(|key| new.contains_key(key));
+
+        for (key, new) in &new {
+            if let (
+                Some(Item::Function {
+                    signature: old_signature,
+                    ..
+                }),
+                Item::Function { signature, .. },
+            ) = (old.get(key), new)
+                && old_signature != signature
+            {
+                // Keys end with the function's name, and maybe a number telling apart
+                // functions of the same path.
+                let path = key.split(" #").next().unwrap_or(key);
+                let name = path.rsplit("::").next().unwrap_or(path);
+
+                let _ = self.signatures.insert(name.to_owned());
+            }
+        }
+    }
 }
 
 /// The source files as the running app was built from them.
@@ -57,137 +135,21 @@ impl Sources {
         Self { files }
     }
 
-    /// The first definition changed in `changed_files` since they were remembered, if any.
-    pub fn changed_definition<'a>(
-        &self,
-        changed_files: impl IntoIterator<Item = &'a PathBuf>,
-    ) -> Option<String> {
-        for file in changed_files {
-            let Some(old) = self.files.get(file) else {
-                // A new file defines new types, which no data has yet.
-                continue;
-            };
-
-            let Ok(new) = std::fs::read_to_string(file) else {
-                continue;
-            };
-
-            if *old == new {
-                continue;
-            }
-
-            // A file that does not parse does not compile either, which the patch reports.
-            let (Some(old), Some(new)) = (definitions(old), definitions(&new)) else {
-                continue;
-            };
-
-            if let Some(name) = old
-                .iter()
-                .find(|(name, tokens)| new.get(*name).is_some_and(|new| new != *tokens))
-                .map(|(name, _)| name)
-            {
-                return Some(format!("{name} in {}", file.display()));
-            }
-        }
-
-        None
-    }
-
-    /// Whether all changes in `changed_files` since they were remembered are in the bodies of
-    /// functions that are compiled in their own crate only: not generic, not `#[inline]`, not
-    /// `const` and not `async` (whose body is a type). Other crates call such functions, but
-    /// have none of their code.
-    pub fn only_bodies_changed<'a>(
-        &self,
-        changed_files: impl IntoIterator<Item = &'a PathBuf>,
-    ) -> bool {
-        changed_files.into_iter().all(|file| {
-            let (Some(old), Ok(new)) = (self.files.get(file), std::fs::read_to_string(file)) else {
-                return false;
-            };
-
-            if *old == new {
-                return true;
-            }
-
-            let (Some(old), Some(new)) = (items(old), items(&new)) else {
-                return false;
-            };
-
-            new.iter().all(|(key, new)| match (old.get(key), new) {
-                (Some(Item::Other(old)), Item::Other(new)) => old == new,
-                (
-                    Some(Item::Function {
-                        signature: old_signature,
-                        body: old_body,
-                        ..
-                    }),
-                    Item::Function {
-                        signature,
-                        body,
-                        is_local,
-                    },
-                ) => old_signature == signature && (old_body == body || *is_local),
-                // A new function is new code.
-                (None, Item::Function { is_local, .. }) => *is_local,
-                _ => false,
-            }) && old.keys().all(|key| new.contains_key(key))
-        })
-    }
-
-    /// The names of the functions whose signature changed in `changed_files` since they were
-    /// remembered. Old code calls them with the old arguments, which the new versions would
-    /// read wrongly.
-    pub fn changed_signatures<'a>(
-        &self,
-        changed_files: impl IntoIterator<Item = &'a PathBuf>,
-    ) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
+    /// How `changed_files` changed since they were remembered.
+    pub fn changes<'a>(&self, changed_files: impl IntoIterator<Item = &'a PathBuf>) -> Changes {
+        let mut changes = Changes {
+            only_bodies: true,
+            ..Changes::default()
+        };
 
         for file in changed_files {
-            let (Some(old), Ok(new)) = (self.files.get(file), std::fs::read_to_string(file)) else {
-                continue;
-            };
+            let new = std::fs::read_to_string(file).ok();
 
-            if *old == new {
-                continue;
-            }
-
-            let (Some(old), Some(new)) = (items(old), items(&new)) else {
-                continue;
-            };
-
-            for (key, new) in &new {
-                if let (
-                    Some(Item::Function {
-                        signature: old_signature,
-                        ..
-                    }),
-                    Item::Function { signature, .. },
-                ) = (old.get(key), new)
-                    && old_signature != signature
-                {
-                    // Keys end with the function's name, and maybe a number telling apart
-                    // functions of the same path.
-                    let path = key.split(" #").next().unwrap_or(key);
-                    let name = path.rsplit("::").next().unwrap_or(path);
-
-                    let _ = names.insert(name.to_owned());
-                }
-            }
+            changes.compare(file, self.files.get(file), new.as_deref());
+            changes.sources.push((file.clone(), new));
         }
 
-        names
-    }
-
-    /// The current contents of `files`, to [`Sources::remember`] once the app runs them.
-    pub fn read_files<'a>(
-        files: impl IntoIterator<Item = &'a PathBuf>,
-    ) -> Vec<(PathBuf, Option<String>)> {
-        files
-            .into_iter()
-            .map(|file| (file.clone(), std::fs::read_to_string(file).ok()))
-            .collect()
+        changes
     }
 
     /// Remember the contents of files that the app now runs.
@@ -205,15 +167,28 @@ impl Sources {
     }
 }
 
-/// The definitions in `source` that data depends on, by their path in the file, as tokens
+/// Insert `value` under `key`, numbered if the key is taken: functions can define items with the
+/// same name.
+fn insert_unique<T>(map: &mut HashMap<String, T>, key: String, value: T) {
+    let mut unique = key.clone();
+    let mut index = 1;
+
+    while map.contains_key(&unique) {
+        index += 1;
+        unique = format!("{key} #{index}");
+    }
+
+    let _ = map.insert(unique, value);
+}
+
+/// The definitions in `file` that data depends on, by their path in the file, as tokens
 /// without doc comments.
-fn definitions(source: &str) -> Option<HashMap<String, String>> {
-    let file = syn::parse_file(source).ok()?;
+fn definitions(file: &syn::File) -> HashMap<String, String> {
     let mut collector = Collector::default();
 
-    collector.visit_file(&file);
+    collector.visit_file(file);
 
-    Some(collector.definitions)
+    collector.definitions
 }
 
 #[derive(Default)]
@@ -225,17 +200,10 @@ struct Collector {
 
 impl Collector {
     fn add(&mut self, kind: &str, name: String, item: &impl ToTokens) {
-        let mut key = format!("{kind} `{}{name}`", self.prefix());
-
-        // Functions can define items with the same name.
-        let mut index = 1;
-        while self.definitions.contains_key(&key) {
-            index += 1;
-            key = format!("{kind} `{}{name}` #{index}", self.prefix());
-        }
-
+        let key = format!("{kind} `{}{name}`", self.prefix());
         let tokens = without_docs(item.to_token_stream()).to_string();
-        let _ = self.definitions.insert(key, tokens);
+
+        insert_unique(&mut self.definitions, key, tokens);
     }
 
     fn prefix(&self) -> String {
@@ -350,34 +318,23 @@ enum Item {
     Function {
         signature: String,
         body: String,
-        /// Whether the function is compiled in its crate only (see [`Sources::only_bodies_changed`]).
+        /// Whether the function is compiled in its crate only (see [`Changes::only_bodies`]).
         is_local: bool,
     },
     Other(String),
 }
 
-/// The items of `source`, by their path in the file.
-fn items(source: &str) -> Option<HashMap<String, Item>> {
-    let file = syn::parse_file(source).ok()?;
+/// The items of `file`, by their path in the file.
+fn items(file: &syn::File) -> HashMap<String, Item> {
     let mut items = HashMap::new();
 
     collect_items(&file.items, "", &mut items);
 
-    Some(items)
+    items
 }
 
 fn collect_items(source: &[syn::Item], prefix: &str, items: &mut HashMap<String, Item>) {
-    let add = |key: String, item: Item, items: &mut HashMap<String, Item>| {
-        let mut unique = key.clone();
-        let mut index = 1;
-
-        while items.contains_key(&unique) {
-            index += 1;
-            unique = format!("{key} #{index}");
-        }
-
-        let _ = items.insert(unique, item);
-    };
+    let add = |key, item, items: &mut HashMap<String, Item>| insert_unique(items, key, item);
 
     for item in source {
         match item {
@@ -495,8 +452,8 @@ mod tests {
     use super::*;
 
     fn changed(old: &str, new: &str) -> bool {
-        let old = definitions(old).unwrap();
-        let new = definitions(new).unwrap();
+        let old = definitions(&syn::parse_file(old).unwrap());
+        let new = definitions(&syn::parse_file(new).unwrap());
 
         old.iter()
             .any(|(name, tokens)| new.get(name).is_some_and(|new| new != tokens))
@@ -519,7 +476,7 @@ mod tests {
         assert!(!changed("struct A;", "struct A; struct B { y: f32 }"));
     }
 
-    fn only_bodies(old: &str, new: &str) -> bool {
+    fn changes(old: &str, new: &str) -> Changes {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("lib.rs");
 
@@ -527,7 +484,11 @@ mod tests {
         let sources = Sources::read([directory.path()]);
         std::fs::write(&file, new).unwrap();
 
-        sources.only_bodies_changed([&file])
+        sources.changes([&file])
+    }
+
+    fn only_bodies(old: &str, new: &str) -> bool {
+        changes(old, new).only_bodies
     }
 
     #[test]
@@ -581,14 +542,7 @@ mod tests {
     }
 
     fn signatures(old: &str, new: &str) -> Vec<String> {
-        let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("lib.rs");
-
-        std::fs::write(&file, old).unwrap();
-        let sources = Sources::read([directory.path()]);
-        std::fs::write(&file, new).unwrap();
-
-        sources.changed_signatures([&file]).into_iter().collect()
+        changes(old, new).signatures.into_iter().collect()
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use cargo_hot::Result;
+use cargo_hot::detour::{Detour, JUMP_SIZE};
 use cargo_hot::hotpatch;
 use cargo_hot::layout;
 use cargo_hot::link::{self, LinkerFlavor};
@@ -168,11 +169,18 @@ fn function_name(symbol: &str) -> Option<String> {
     Some(path.rsplit("::").next().unwrap_or(path).to_owned())
 }
 
-/// The size of the jump that redirects a function.
-const JUMP_SIZE: u64 = 5;
-
 /// Windows maps images at multiples of 64 KiB.
 const PATCH_ALIGNMENT: u64 = 64 << 10;
+
+/// Where the app's executable is loaded, given the address of its `main`.
+fn exe_base(cache: &hotpatch::Cache, aslr_reference: u64) -> Result<u64> {
+    let main = cache
+        .symbol_table
+        .get("main")
+        .context("No `main` in the executable")?;
+
+    Ok(aslr_reference - main.address)
+}
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
@@ -236,9 +244,10 @@ struct PatchState {
     patches: Vec<LoadedPatch>,
     /// The jump table of the last patch, with absolute addresses, on Windows.
     jump_table: subsecond_types::AddressMap,
-    /// The content hashes of the object files of each library, as last linked whole into a
-    /// patch. Later patches of only function bodies link just the object files that changed.
-    linked_objects: HashMap<String, HashSet<u64>>,
+    /// The content hashes of the object files of each library's rlib, as last linked whole
+    /// into a patch. Later patches of only function bodies link just the object files that
+    /// changed.
+    linked_objects: HashMap<PathBuf, HashSet<u64>>,
     /// The functions whose versions in the executable must not be redirected, by name (see
     /// [`LoadedPatch::kept`]).
     kept: HashSet<String>,
@@ -248,11 +257,11 @@ impl PatchState {
     /// Forget what the app had loaded, when it runs the same executable again. The libraries
     /// recompiled since that executable was built still have to be part of every patch.
     fn app_restarted(&mut self) {
-        self.next_patch_base = None;
-        self.patches.clear();
-        self.jump_table.clear();
-        self.linked_objects.clear();
-        self.kept.clear();
+        *self = Self {
+            modified: std::mem::take(&mut self.modified),
+            pending: std::mem::take(&mut self.pending),
+            ..Self::default()
+        };
     }
 }
 
@@ -269,20 +278,13 @@ struct LoadedPatch {
 /// A patch, ready to be sent to the app.
 struct Patch {
     jump_table: JumpTable,
+    /// The address the patch is linked for, if any.
+    base: Option<u64>,
     /// The jumps from old functions to the patched ones, once the app has loaded the patch.
     detours: Vec<Detour>,
     /// The object files of the libraries linked whole, for [`PatchState::linked_objects`]
     /// once the app runs the patch.
-    linked_objects: HashMap<String, HashSet<u64>>,
-}
-
-/// A jump from the entry of an old function to its new version (see `cargo_hot::detour`).
-#[derive(Debug, Clone, Copy)]
-struct Detour {
-    from: u64,
-    to: u64,
-    /// The base of the image `from` is in.
-    image: u64,
+    linked_objects: HashMap<PathBuf, HashSet<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -649,27 +651,20 @@ impl Server {
             needs_restart = needs_restart || crashed || changed_crates.is_none();
 
             let layout_start = Instant::now();
-            let changed_definition = (!needs_restart)
-                .then(|| sources.changed_definition(&changed_files))
-                .flatten();
+            let mut changes = sources.changes(&changed_files);
+            let changed_sources = std::mem::take(&mut changes.sources);
             log::debug!(
-                "Checked the changed definitions in {:.2?}",
+                "Compared the changed files in {:.2?}",
                 layout_start.elapsed()
             );
 
-            if let Some(definition) = changed_definition {
+            if !needs_restart && let Some(definition) = &changes.definition {
                 log::info!(
                     "Restarting, since patched code would read the app's data with the \
                     layout of the new {definition}"
                 );
                 needs_restart = true;
             }
-
-            let changes = layout::Changes {
-                only_bodies: sources.only_bodies_changed(&changed_files),
-                signatures: sources.changed_signatures(&changed_files),
-            };
-            let changed_sources = layout::Sources::read_files(&changed_files);
 
             let start = Instant::now();
 
@@ -753,7 +748,7 @@ impl Server {
                 }
             };
 
-            if let Some(base) = patch_state.patches.last().map(|patch| patch.base)
+            if let Some(base) = patch.base
                 && !patch.detours.is_empty()
                 && let Err(error) = self
                     .redirect(
@@ -1011,37 +1006,33 @@ impl Server {
             && !changed_crates.is_empty()
             && !changed_files.iter().any(|file| self.is_target_file(file)));
 
+        if !compile_target {
+            log::debug!("Only function bodies changed, compiling {changed_crates:?} alone");
+        }
+
+        let changed_rlibs = changed_crates
+            .iter()
+            .map(|crate_name| self.rlib(crate_name))
+            .collect::<Result<Vec<_>>>()?;
+
         // Compiling a library forgets which of its object files the app runs.
-        let linked_objects: HashMap<PathBuf, HashSet<u64>> = changed_crates
+        let linked_objects: HashMap<PathBuf, HashSet<u64>> = changed_rlibs
             .iter()
             .filter(|_| !compile_target)
-            .filter_map(|krate| {
-                Some((
-                    self.rlib(krate).ok()?,
-                    state.linked_objects.get(krate)?.clone(),
-                ))
-            })
+            .filter_map(|rlib| Some((rlib.clone(), state.linked_objects.get(rlib)?.clone())))
             .collect();
 
-        let workspace_rlibs: Vec<PathBuf> = if compile_target {
-            self.compile_workspace_crates(changed_crates.clone(), true, state)
-                .await?;
+        self.compile_workspace_crates(changed_crates, compile_target, state)
+            .await?;
 
+        let workspace_rlibs = if compile_target {
             state
                 .modified
                 .iter()
                 .map(|crate_name| self.rlib(crate_name))
                 .collect::<Result<_>>()?
         } else {
-            log::debug!("Only function bodies changed, compiling {changed_crates:?} alone");
-
-            self.compile_workspace_crates(changed_crates.clone(), false, state)
-                .await?;
-
-            changed_crates
-                .iter()
-                .map(|crate_name| self.rlib(crate_name))
-                .collect::<Result<_>>()?
+            changed_rlibs
         };
 
         let cache = build.patch_cache.clone().unwrap();
@@ -1069,7 +1060,7 @@ impl Server {
             patch_base,
             changed_files: changed_files.into_iter().collect(),
             aslr_reference,
-            cache: build.patch_cache.clone().unwrap(),
+            cache: cache.clone(),
         };
 
         let patch = match self.build(mode.clone()).await {
@@ -1096,11 +1087,8 @@ impl Server {
         }
 
         let jump_table_start = Instant::now();
-        let mut jump_table = hotpatch::create_jump_table(
-            &self.patch_exe(patch.time_start),
-            &self.triple,
-            build.patch_cache.as_ref().unwrap(),
-        )?;
+        let mut jump_table =
+            hotpatch::create_jump_table(&self.patch_exe(patch.time_start), &self.triple, &cache)?;
 
         // subsecond takes the table's addresses as relative to the patch's `main`, unless the
         // base of `main` is given as absolute too. Absolute addresses can point into earlier
@@ -1149,18 +1137,11 @@ impl Server {
             }
         });
 
-        let linked_objects = changed_crates
-            .into_iter()
-            .filter_map(|krate| {
-                let objects = patch.linked_objects.get(&self.rlib(&krate).ok()?)?.clone();
-                Some((krate, objects))
-            })
-            .collect();
-
         Ok(Patch {
             jump_table,
+            base: patch_base,
             detours,
-            linked_objects,
+            linked_objects: patch.linked_objects,
         })
     }
 
@@ -1184,12 +1165,7 @@ impl Server {
         let functions =
             hotpatch::patch_functions(&module.with_extension("map"), &self.crate_names())?;
 
-        let exe_base = aslr_reference
-            - cache
-                .symbol_table
-                .get("main")
-                .context("No `main` in the executable")?
-                .address;
+        let exe_base = exe_base(cache, aslr_reference)?;
 
         if !changed_signatures.is_empty() {
             log::debug!(
@@ -1273,7 +1249,7 @@ impl Server {
         executable: &process::Child,
         module: PathBuf,
         base: u64,
-        detours: Vec<Detour>,
+        mut detours: Vec<Detour>,
     ) -> Result<()> {
         use cargo_hot::detour;
 
@@ -1283,11 +1259,6 @@ impl Server {
         let count = detours.len();
 
         tokio::task::spawn_blocking(move || {
-            let mut detours: Vec<detour::Detour> = detours
-                .into_iter()
-                .map(|Detour { from, to, image }| detour::Detour { from, to, image })
-                .collect();
-
             detour::load(pid, &module, base)?;
             detour::apply(pid, &mut detours)
         })
@@ -1337,12 +1308,7 @@ impl Server {
             return Ok(None);
         }
 
-        let main = cache
-            .symbol_table
-            .get("main")
-            .context("No `main` in the executable")?;
-
-        let exe_base = aslr_reference - main.address;
+        let exe_base = exe_base(cache, aslr_reference)?;
         let exe_end = exe_base + hotpatch::pe_image_size(&self.main_exe())?;
         let base = state
             .next_patch_base
@@ -1467,7 +1433,9 @@ impl Server {
 
             let _ = stale.remove(&crate_name);
             let _ = state.pending.remove(&crate_name);
-            let _ = state.linked_objects.remove(&crate_name);
+            if let Ok(rlib) = self.rlib(&crate_name) {
+                let _ = state.linked_objects.remove(&rlib);
+            }
             let _ = state.modified.insert(crate_name);
         };
 

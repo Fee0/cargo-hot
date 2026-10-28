@@ -1,4 +1,3 @@
-#[cfg(windows)]
 pub mod detour;
 pub mod hotpatch;
 pub mod layout;
